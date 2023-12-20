@@ -1,0 +1,16 @@
+code/CMakeFiles/*
+code/.cache/*
+code/build/*
+
+Makefile
+cmake_install.cmake
+CMakeCache.txt
+build/*
+
+*.json
+*.vtu
+*.fdb_latexmk
+*.fls
+*.log
+*.synctex.gz
+*.aux

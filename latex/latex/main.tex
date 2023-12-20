@@ -1,0 +1,57 @@
+\documentclass{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx} % Required for inserting images
+
+\usepackage{amsmath, amssymb}
+\usepackage{diffcoeff, cancel}
+
+\newcommand\ang[1]{\left\langle #1 \right\rangle}
+
+\title{Cahn-Hilliard with Deal.II}
+\author{Aiden Huffman}
+\date{October 2023}
+
+\begin{document}
+
+\maketitle
+
+We use the linearly stable splitting scheme described in Kim
+\begin{align}
+    \phi^n &= \phi^{n-1} + k \left[\nabla^2 \eta + \nabla^2 \left(f'(\phi^{n-1}) - 2\phi^{n-1}\right)\right]\\
+    \eta &= 2\phi^n - \epsilon^2 \nabla^2\phi^n
+\end{align}
+where $f'(\phi^{n-1}) = (\phi^{n-1})^3 - \phi^{n-1}$.
+After projecting into the test space, we obtain
+\begin{align}
+    \ang{\varphi, \phi^n} &= \ang{\varphi,\phi^{n-1}} - k \ang{\nabla\varphi, \nabla\eta} - k\ang{\nabla \varphi, \nabla f'(\phi^{n-1})} + 2k\ang{\nabla \varphi, \nabla \phi^{n-1}}\\
+    \ang{\varphi, \eta} &= 2\ang{\varphi,\phi^n} + \epsilon^2 \ang{\nabla\varphi_i, \nabla\phi^n}
+\end{align}
+If $\varphi$ is assumed to be from a finite dimensional test space, and $\phi^n,\, \eta$ are also in the test space then we obtain a finite dimensional system of equations
+\begin{align}
+    \ang{\varphi_i, \varphi_j}\phi^n_j &= \ang{\varphi_i,\phi^{n-1}} - k \ang{\nabla\varphi_i, \nabla\varphi_j}\eta_j - k\ang{\nabla \varphi_i,\nabla f'(\phi^{n-1})} + 2k\ang{\nabla \varphi_i, \nabla \phi^{n-1}}\\
+    \ang{\varphi_i, \varphi_j}\eta_j &= 2\ang{\varphi_i,\varphi_j}\phi^n_j + \epsilon^2 \ang{\nabla\varphi_i, \nabla\varphi_j}\phi^n_j
+\end{align}
+Noting that $M = \ang{\varphi_i, \varphi_j}$ is the mass matrix and $A = \ang{\nabla\varphi_i, \nabla\varphi_j}$ is the stiffness or Laplace matrix we obtain
+\begin{align}
+    M\phi^n &= \ang{\varphi_i,\phi^{n-1}} - k A\eta - k\ang{\nabla \varphi_i,\nabla f'(\phi^{n-1})} + 2k\ang{\nabla \varphi_i, \nabla \phi^{n-1}}\\
+    M\eta_j &= 2M\phi^n + \epsilon^2 A\phi^n
+\end{align}
+which can be compactly represented with the following linear system
+\begin{equation}
+    \begin{bmatrix}
+        M & kA\\
+        -(2M + \epsilon^2 A) & M
+    \end{bmatrix}\begin{bmatrix}
+        \phi^n\\
+        \eta
+    \end{bmatrix} = \begin{bmatrix}
+        F(\phi^{n-1})\\
+        0
+    \end{bmatrix}
+\end{equation}
+where
+\begin{align}
+    F_i(\phi^{n-1}) &= \ang{\varphi_i, \phi^{n-1}} - k\ang{\nabla \varphi_i, \nabla (\phi^{n-1})^3} + k\ang{\nabla\varphi_i, \nabla \phi^{n-1}} + 2k\ang{\nabla\varphi_i, \nabla\phi^{n-1}}\\
+    &= \ang{\varphi_i, \phi^{n-1}} - k\ang{\nabla\varphi_i, 3(\phi^{n-1})^2\nabla\phi^{n-1}} + 3k\ang{\nabla \varphi_i, \nabla \phi^{n-1}}
+\end{align}
+\end{document}

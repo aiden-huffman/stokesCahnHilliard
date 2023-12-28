@@ -9,6 +9,7 @@ build/*
 
 *.json
 *.vtu
+*.vtk
 *.fdb_latexmk
 *.fls
 *.log

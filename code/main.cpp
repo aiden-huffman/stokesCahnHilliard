@@ -85,10 +85,28 @@ double InitialValuesPhi<dim>::value(
     const Point<dim> &p,
     const uint       component) const
 {
+
     (void) component;
-    return std::tanh(
-        (p.norm()-0.25) / (std::sqrt(2) * this->eps)
+
+    Point<dim> shifted_p1 = p;
+    Point<dim> shifted_p2 = p;
+
+    shifted_p1[0] -= 0.25;
+    shifted_p1[1] -= 0.25;
+
+    shifted_p2[0] += 0.25;
+    shifted_p2[1] += 0.25;
+
+    double droplet_1 = std::tanh(
+        (shifted_p1.norm()-0.25) / (std::sqrt(2) * this->eps)
     );
+
+    double droplet_2 = std::tanh(
+            (shifted_p2.norm()-0.25) / (std::sqrt(2) * this->eps)
+    );
+
+
+    return droplet_1 * droplet_2;
 }
 
 } // EquationData
@@ -209,10 +227,6 @@ class SCHSolver
         void initializeValues();
         void refineGrid();
 
-        void assembleCurvature();
-        void solveCurvature();
-        void outputCurvature();
-
         void assembleStokes();
         void outputSurfaceTension();
         void solveStokes();
@@ -243,10 +257,6 @@ class SCHSolver
         Vector<double>          solution_old_ch;
         Vector<double>          rhs_ch;
         
-        SparseMatrix<double>    system_matrix_curve;
-        Vector<double>          solution_curve;
-        Vector<double>          rhs_curve;
-
         double      timestep;
         double      time;
         uint        timestep_number;
@@ -564,10 +574,6 @@ void SCHSolver<dim>::setupLinearSystems()
     this->solution_old_ch.reinit(this->dof_handler_ch.n_dofs());
     this->rhs_ch.reinit(this->dof_handler_ch.n_dofs());
     
-    this->system_matrix_curve.reinit(this->sparsity_pattern_ch);
-    this->solution_curve.reinit(this->dof_handler_ch.n_dofs());
-    this->rhs_curve.reinit(this->dof_handler_ch.n_dofs());
-    
 }
 
 template<int dim>
@@ -592,72 +598,6 @@ void SCHSolver<dim>::initializeValues()
                     << *phi_range.first << ", " 
                     << *phi_range.second
                 << ")" << std::endl;
-}
-
-template<int dim>
-void SCHSolver<dim>::assembleCurvature()
-{
-    std::cout << "Assembling curvature system... ";
-
-    this->system_matrix_curve   = 0;
-    this->rhs_curve             = 0;
-
-    FEValues<dim> fe_values_ch(this->fe_ch,
-                               this->quad_formula,
-                               update_values |
-                               update_gradients |
-                               update_JxW_values);
-    const uint dofs_per_cell = this->fe_ch.n_dofs_per_cell();
-    
-    FullMatrix<double>  local_matrix(dofs_per_cell,
-                                     dofs_per_cell);
-    Vector<double>      local_rhs(dofs_per_cell);
-
-    std::vector<Tensor<1,dim>>   cell_grad_ch(this->quad_formula.size());
-
-    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-
-    for(const auto &cell : this->dof_handler_ch.active_cell_iterators())
-    {
-        fe_values_ch.reinit(cell);
-        local_matrix    = 0;
-        local_rhs       = 0;
-        
-        cell->get_dof_indices(local_dof_indices);
-
-        fe_values_ch.get_function_gradients(
-            this->solution_old_ch,
-            cell_grad_ch
-        );
-
-        for(uint q_index = 0; q_index < this->quad_formula.size(); q_index++)
-        {
-            Tensor<1,dim> grad_ch = cell_grad_ch[q_index];
-
-            for(uint i = 0; i < dofs_per_cell; i++)
-            {
-                for(uint j = 0; j < dofs_per_cell; j++)
-                {
-                    local_matrix(i,j) += fe_values_ch.shape_value(i,q_index)
-                        * fe_values_ch.shape_value(j,q_index)
-                        * fe_values_ch.JxW(q_index);
-                }
-
-                double norm = grad_ch.norm();
-                 
-                local_rhs(i) += -fe_values_ch.shape_grad(i,q_index) * grad_ch / (norm + 1e-4);
-            }
-        }
-
-        this->constraints_ch.distribute_local_to_global(
-            local_matrix,
-            local_rhs,
-            local_dof_indices,
-            this->system_matrix_curve,
-            this->rhs_curve);
-    }
-    
-    std::cout << "Completed." << std::endl;
 }
 
 template<int dim>
@@ -707,6 +647,7 @@ void SCHSolver<dim>::assembleStokes()
     
     std::vector<double>         kappa_values(n_q_points);
     std::vector<Tensor<1,dim>>  grad_phi_cell(n_q_points);
+    std::vector<Tensor<2, dim>> grad_outer_phi(n_q_points);
     
     auto cell       = this->dof_handler_stokes.begin_active();
     auto cell_ch    = this->dof_handler_ch.begin_active();
@@ -728,14 +669,26 @@ void SCHSolver<dim>::assembleStokes()
 
         fe_val_ch.get_function_gradients(this->solution_old_ch,
                                          grad_phi_cell);
-        fe_val_ch.get_function_values(this->solution_curve,
-                                      kappa_values);
+
+        // Construct \nabla \phi \otimes \nabla \phi
+        for(uint q = 0; q < n_q_points; q++)
+        {
+            for(uint i = 0; i < dim; i++)
+            {
+                for(uint j = 0; j < dim; j++)
+                {
+                    grad_outer_phi[q][i][j] = -grad_phi_cell[q][i] 
+                                            * grad_phi_cell[q][j];
+                    
+                    if (i == j) grad_outer_phi[q][i][j] 
+                        += std::pow(grad_phi_cell[q].norm(),2);
+                }
+            }
+        }
 
         for(uint q = 0; q < n_q_points; q++)
         {
-            const Tensor<1,dim> grad_phi    = grad_phi_cell[q];
-            const double        kappa       = kappa_values[q];
-        
+
             for(uint k = 0; k < dofs_per_cell; k++)
             {
                 symgrad_phi_u[k] =
@@ -743,7 +696,9 @@ void SCHSolver<dim>::assembleStokes()
                 div_phi_u[k]    = fe_val_stokes[velocities].divergence(k,q);
                 phi_u[k]        = fe_val_stokes[velocities].value(k,q);
                 phi_p[k]        = fe_val_stokes[pressure].value(k,q);
+
             }
+
 
             for(uint i = 0; i < dofs_per_cell; i++)
             {
@@ -759,9 +714,10 @@ void SCHSolver<dim>::assembleStokes()
                         (phi_p[i] * phi_p[j]) * fe_val_stokes.JxW(q);
                 }
 
-                local_rhs(i) += -24 * std::sqrt(2) * this->eps * 1.0e-7
-                    * kappa * grad_phi.norm() * grad_phi
-                    * phi_u[i] * fe_val_stokes.JxW(q);
+                local_rhs(i) += -24 * std::sqrt(2) * this->eps * 1.0e-4
+                    * scalar_product(fe_val_stokes[velocities].gradient(i,q),
+                                     grad_outer_phi[q])
+                    * fe_val_stokes.JxW(q);
             }
         }
 
@@ -779,27 +735,6 @@ void SCHSolver<dim>::assembleStokes()
             this->system_matrix_precon
         );
     }
-}
-
-template<int dim>
-void SCHSolver<dim>::solveCurvature()
-{
-    std::cout << "Solving for curvature" << std::endl;
-
-    SolverControl               solver_control(this->rhs_curve.size(),
-                                               1e-12);
-    SolverCG<Vector<double>>    cg(solver_control);
-
-    PreconditionSSOR<SparseMatrix<double>> precon;
-    precon.initialize(this->system_matrix_curve, 1.2);
-
-    cg.solve(this->system_matrix_curve, this->solution_curve,
-             this->rhs_curve, precon);
-
-    std::cout   << "\tSolved curvature for current state of system\n"
-                << "\tNumber of CG iterations: " << solver_control.last_step()
-                << std::endl;
-            
 }
 
 template<int dim>
@@ -883,21 +818,6 @@ void SCHSolver<dim>::refineGrid()
         this->dof_handler_ch,
         QGauss<dim-1>(degree+1),
         {},
-        this->solution_curve,
-        estimated_error_per_cell,
-        {}, {}, {}, {}, {},
-        KellyErrorEstimator<dim>::face_diameter_over_twice_max_degree
-    );
-    
-    GridRefinement::refine_and_coarsen_optimize(
-        this->triangulation,
-        estimated_error_per_cell
-    );
-    
-    KellyErrorEstimator<dim>::estimate(
-        this->dof_handler_ch,
-        QGauss<dim-1>(degree+1),
-        {},
         this->solution_ch,
         estimated_error_per_cell,
         {}, {}, {}, {}, {},
@@ -924,10 +844,9 @@ void SCHSolver<dim>::refineGrid()
 
     SolutionTransfer<dim, Vector<double>> ch_trans(this->dof_handler_ch);
 
-    std::vector<Vector<double>> pre_refine_sol(3);
-    pre_refine_sol[0] = this->solution_curve;
-    pre_refine_sol[1] = this->solution_ch;
-    pre_refine_sol[2] = this->solution_old_ch;
+    std::vector<Vector<double>> pre_refine_sol(2);
+    pre_refine_sol[0] = this->solution_ch;
+    pre_refine_sol[1] = this->solution_old_ch;
 
     triangulation.prepare_coarsening_and_refinement();
     ch_trans.prepare_for_coarsening_and_refinement(pre_refine_sol);
@@ -937,39 +856,20 @@ void SCHSolver<dim>::refineGrid()
     this->setupDoFs();
     this->setupLinearSystems();
 
-    std::vector<Vector<double>> tmp(3);
-    tmp[0].reinit(this->solution_curve);
-    tmp[1].reinit(this->solution_ch);
-    tmp[2].reinit(this->solution_old_ch);
+    std::vector<Vector<double>> tmp(2);
+    tmp[0].reinit(this->solution_ch);
+    tmp[1].reinit(this->solution_old_ch);
 
     ch_trans.interpolate(pre_refine_sol, tmp);
 
-    this->solution_curve    = tmp[0];
-    this->solution_ch       = tmp[1];
-    this->solution_old_ch   = tmp[2];
+    this->solution_ch       = tmp[0];
+    this->solution_old_ch   = tmp[1];
 
-    this->constraints_ch.distribute(this->solution_curve);
     this->constraints_ch.distribute(this->solution_ch);
     this->constraints_ch.distribute(this->solution_old_ch);
 
     std::cout << "Completed." << std::endl;
     
-}
-
-template<int dim>
-void SCHSolver<dim>::outputCurvature()
-{
-    DataOut<dim>    data_out;
-    data_out.attach_dof_handler(this->dof_handler_ch);
-    data_out.add_data_vector(this->solution_curve, "kappa");
-    data_out.add_data_vector(this->solution_old_ch, "phi");
-    data_out.build_patches();
-
-    DataOutBase::VtkFlags vtk_flags;
-    vtk_flags.compression_level = DataOutBase::VtkFlags::ZlibCompressionLevel::best_speed;
-    data_out.set_flags(vtk_flags);
-    std::ofstream output("curvature.vtu");
-    data_out.write_vtu(output);
 }
 
 template<int dim>
@@ -1026,25 +926,15 @@ void SCHSolver<dim>::run(
     this->setupLinearSystems();
     
     this->initializeValues();
-    this->assembleCurvature();
-    this->solveCurvature();
 
     for(uint i = 0; i < 6; i++)
     {
+
         this->refineGrid();
-        this->initializeValues();
-        this->assembleCurvature();
-        this->solveCurvature();
-    
+        this->initializeValues(); 
 
     }
     
-    this->initializeValues();
-    this->assembleCurvature();
-    this->solveCurvature();
-
-    if(debug) this->outputCurvature();
-
     this->assembleStokes();
     if(debug) this->outputSurfaceTension();
 

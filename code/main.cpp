@@ -5,14 +5,17 @@
 #include <deal.II/base/data_out_base.h>
 #include <deal.II/base/quadrature.h>
 #include <deal.II/base/subscriptor.h>
+#include <deal.II/base/tensor.h>
 #include <deal.II/base/types.h>
 #include <deal.II/base/function.h>
 
+#include <deal.II/base/utilities.h>
 #include <deal.II/grid/grid_tools.h>
 #include <deal.II/grid/tria.h>
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_refinement.h>
 
+#include <deal.II/numerics/data_component_interpretation.h>
 #include <deal.II/numerics/vector_tools.h>
 #include <deal.II/numerics/matrix_tools.h>
 #include <deal.II/numerics/data_out.h>
@@ -76,7 +79,7 @@ private:
 
 template<int dim>
 InitialValuesPhi<dim>::InitialValuesPhi(double eps)
-    : Function<dim>(1)
+    : Function<dim>(2)
     , eps(eps)
 {}
 
@@ -85,28 +88,31 @@ double InitialValuesPhi<dim>::value(
     const Point<dim> &p,
     const uint       component) const
 {
+    if(component == 0)
+    {
 
-    (void) component;
+        Point<dim> shifted_p1 = p;
+        Point<dim> shifted_p2 = p;
 
-    Point<dim> shifted_p1 = p;
-    Point<dim> shifted_p2 = p;
+        shifted_p1[0] -= 0.25;
+        shifted_p1[1] -= 0.25;
 
-    shifted_p1[0] -= 0.25;
-    shifted_p1[1] -= 0.25;
+        shifted_p2[0] += 0.25;
+        shifted_p2[1] += 0.25;
 
-    shifted_p2[0] += 0.25;
-    shifted_p2[1] += 0.25;
+        double droplet_1 = std::tanh(
+            (shifted_p1.norm()-0.25) / (std::sqrt(2) * this->eps)
+        );
 
-    double droplet_1 = std::tanh(
-        (shifted_p1.norm()-0.25) / (std::sqrt(2) * this->eps)
-    );
+        double droplet_2 = std::tanh(
+                (shifted_p2.norm()-0.25) / (std::sqrt(2) * this->eps)
+        );
 
-    double droplet_2 = std::tanh(
-            (shifted_p2.norm()-0.25) / (std::sqrt(2) * this->eps)
-    );
+        return droplet_1 * droplet_2;
 
-
-    return droplet_1 * droplet_2;
+    } else {
+        return 0;
+    }
 }
 
 } // EquationData
@@ -232,10 +238,16 @@ class SCHSolver
         void solveStokes();
         void outputStokes(const uint timestep_number);
 
+        void assembleCahnHilliard();
+        void solveCahnHilliard();
+        void outputCahnHilliard(const uint timestep_number);
+
+        void outputTimestep(const uint timepstep_number);
+
         uint        degree;
         Triangulation<dim>  triangulation;
         FESystem<dim>       fe_stokes;
-        FE_Q<dim>           fe_ch;
+        FESystem<dim>       fe_ch;
         QGauss<dim>         quad_formula;
 
         DoFHandler<dim>     dof_handler_stokes;
@@ -251,11 +263,11 @@ class SCHSolver
         BlockVector<double>         rhs_stokes;
         BlockSparseMatrix<double>   system_matrix_precon;
 
-        SparsityPattern         sparsity_pattern_ch;
-        SparseMatrix<double>    system_matrix_ch;
-        Vector<double>          solution_ch;
-        Vector<double>          solution_old_ch;
-        Vector<double>          rhs_ch;
+        BlockSparsityPattern         sparsity_pattern_ch;
+        BlockSparseMatrix<double>    system_matrix_ch;
+        BlockVector<double>          solution_ch;
+        BlockVector<double>          solution_old_ch;
+        BlockVector<double>          rhs_ch;
         
         double      timestep;
         double      time;
@@ -283,11 +295,11 @@ SCHSolver<dim>::SCHSolver(const uint degree, const bool debug,
 : degree(degree)
 , triangulation(Triangulation<dim>::maximum_smoothing)
 , fe_stokes(FE_Q<dim>(degree+1), dim, FE_Q<dim>(degree), 1)
-, fe_ch(2)
+, fe_ch(FE_Q<dim>(degree), 2)
 , quad_formula(degree+2)
 , dof_handler_stokes(triangulation)
 , dof_handler_ch(triangulation)
-, timestep(1e-4)
+, timestep(1e-2)
 , time(timestep)
 , timestep_number(1)
 , debug(debug)
@@ -485,16 +497,32 @@ void SCHSolver<dim>::setupDoFs()
 
     std::cout << "Setting up DoFs for Cahn-Hilliard potion" << std::endl;
     {
+    std::vector<uint> block_component(2,0);
+    block_component[1] = 1;
     
     std::cout << "\tDistributing..." << std::endl;
     this->dof_handler_ch.distribute_dofs(this->fe_ch);
-
+    
     std::cout << "\tRenumbering..." << std::endl;
     DoFRenumbering::Cuthill_McKee(this->dof_handler_ch);
+    DoFRenumbering::component_wise(
+            this->dof_handler_ch,
+            block_component
+    );
+    
+    const std::vector<types::global_dof_index> dofs_per_component =
+        DoFTools::count_dofs_per_fe_component(this->dof_handler_ch);
+    
+    const std::vector<types::global_dof_index> block_sizes = 
+        {dofs_per_component[0],
+         dofs_per_component[1]};
 
-    std::cout   << "\tNumber of degrees of freedom: "
-                << dof_handler_ch.n_dofs()
+    std::cout   << "Number of degrees of freedom: "
+                << this->dof_handler_ch.n_dofs()
                 << std::endl;
+    std::cout   << "Per block:\n"
+                << "    Block 0: " << dofs_per_component[0] << std::endl
+                << "    Block 1: " << dofs_per_component[1] << std::endl;
 
     std::cout   << "\tUpdating constraints" << std::endl;
     this->constraints_ch.clear();
@@ -527,8 +555,7 @@ void SCHSolver<dim>::setupDoFs()
 
     std::cout   << "\tBuilding sparsity pattern..."
                 << std::endl;
-    DynamicSparsityPattern dsp(this->dof_handler_ch.n_dofs(),
-                               this->dof_handler_ch.n_dofs());
+    BlockDynamicSparsityPattern dsp(block_sizes, block_sizes);
 
     DoFTools::make_sparsity_pattern(this->dof_handler_ch,
                                     dsp,
@@ -552,7 +579,7 @@ void SCHSolver<dim>::setupLinearSystems()
     
     std::cout   << "Setting up matrix and vector objects for Stokes portion"
                 << std::endl;
-    
+    { 
     std::vector<uint> block_component(dim+1, 0);
     block_component[dim] = 1;
 
@@ -568,12 +595,28 @@ void SCHSolver<dim>::setupLinearSystems()
     this->system_matrix_precon.reinit(this->sparsity_pattern_stokes);
     this->solution_stokes.reinit(block_sizes);
     this->rhs_stokes.reinit(block_sizes);
+    }
+    std::cout << "Completed." << std::endl;
+
+    std::cout   << "Setting up matrix and vector objects for Cahn-Hilliard "
+                << "portion" << std::endl;
+    {
+
+    const std::vector<types::global_dof_index> dofs_per_component =
+        DoFTools::count_dofs_per_fe_component(this->dof_handler_ch);
+    
+    const std::vector<types::global_dof_index> block_sizes = 
+        {dofs_per_component[0],
+         dofs_per_component[1]};
 
     this->system_matrix_ch.reinit(this->sparsity_pattern_ch);
-    this->solution_ch.reinit(this->dof_handler_ch.n_dofs());
-    this->solution_old_ch.reinit(this->dof_handler_ch.n_dofs());
-    this->rhs_ch.reinit(this->dof_handler_ch.n_dofs());
-    
+    this->solution_ch.reinit(block_sizes);
+    this->solution_old_ch.reinit(block_sizes);
+    this->rhs_ch.reinit(block_sizes);
+
+    }
+    std::cout << "Completed" << std::endl;
+
 }
 
 template<int dim>
@@ -589,15 +632,24 @@ void SCHSolver<dim>::initializeValues()
     this->solution_ch = this->solution_old_ch;
 
     auto phi_range = std::minmax_element(
-        this->solution_old_ch.begin(),
-        this->solution_old_ch.end()
-    );
-    
+        this->solution_old_ch.block(0).begin(),
+        this->solution_old_ch.block(0).end());
+    auto eta_range = std::minmax_element(
+        this->solution_old_ch.block(1).begin(),
+        this->solution_old_ch.block(1).end());
+
+
     std::cout   << "Initial values propagated:\n"
                 << "    Phi Range: (" 
                     << *phi_range.first << ", " 
                     << *phi_range.second
-                << ")" << std::endl;
+                << ")" 
+                << std::endl;
+    std::cout   << "    Eta Range: (" 
+                    << *eta_range.first << ", " 
+                    << *eta_range.second
+                << ")" 
+                << std::endl;
 }
 
 template<int dim>
@@ -645,7 +697,6 @@ void SCHSolver<dim>::assembleStokes()
     std::vector<Tensor<1, dim>>          phi_u(dofs_per_cell);
     std::vector<double>                  phi_p(dofs_per_cell);
     
-    std::vector<double>         kappa_values(n_q_points);
     std::vector<Tensor<1,dim>>  grad_phi_cell(n_q_points);
     std::vector<Tensor<2, dim>> grad_outer_phi(n_q_points);
     
@@ -655,6 +706,7 @@ void SCHSolver<dim>::assembleStokes()
     
     const FEValuesExtractors::Vector velocities(0);
     const FEValuesExtractors::Scalar pressure(dim);
+    const FEValuesExtractors::Scalar phi(0);
 
     for(; cell != endc; cell++, cell_ch++)
     {
@@ -667,8 +719,8 @@ void SCHSolver<dim>::assembleStokes()
 
         cell->get_dof_indices(local_dof_indices);
 
-        fe_val_ch.get_function_gradients(this->solution_old_ch,
-                                         grad_phi_cell);
+        fe_val_ch[phi].get_function_gradients(this->solution_old_ch,
+                                              grad_phi_cell);
 
         // Construct \nabla \phi \otimes \nabla \phi
         for(uint q = 0; q < n_q_points; q++)
@@ -714,7 +766,7 @@ void SCHSolver<dim>::assembleStokes()
                         (phi_p[i] * phi_p[j]) * fe_val_stokes.JxW(q);
                 }
 
-                local_rhs(i) += -24 * std::sqrt(2) * this->eps * 1.0e-4
+                local_rhs(i) += -24 * std::sqrt(2) * this->eps * 1e-2
                     * scalar_product(fe_val_stokes[velocities].gradient(i,q),
                                      grad_outer_phi[q])
                     * fe_val_stokes.JxW(q);
@@ -808,11 +860,269 @@ void SCHSolver<dim>::solveStokes()
 }
 
 template<int dim>
+void SCHSolver<dim>::assembleCahnHilliard()
+{
+
+    std::cout << "Assembling Cahn-Hilliard system" << std::endl;
+
+    this->system_matrix_ch  = 0;
+    this->rhs_ch            = 0;
+    
+    FEValues fe_val_stokes(
+        this->fe_stokes,
+        this->quad_formula,
+        update_values |
+        update_JxW_values
+    );
+    FEValues fe_val_ch(
+        this->fe_ch,
+        this->quad_formula,
+        update_values |
+        update_gradients |
+        update_JxW_values
+    );
+
+    const unsigned int dofs_per_cell = this->fe_ch.n_dofs_per_cell();
+
+    FullMatrix<double>  local_matrix(
+        dofs_per_cell, 
+        dofs_per_cell
+    );
+    Vector<double>      local_rhs(dofs_per_cell);
+
+    std::vector<double>         phi_val(dofs_per_cell);
+    std::vector<Tensor<1,dim>>  phi_grad(dofs_per_cell);
+    std::vector<double>         eta_val(dofs_per_cell);
+    std::vector<Tensor<1,dim>>  eta_grad(dofs_per_cell);
+
+    std::vector<double>         cell_old_phi_values(this->quad_formula.size());
+    std::vector<Tensor<1,dim>>  cell_old_phi_grad(this->quad_formula.size());
+    
+    std::vector<Tensor<1,dim>>  cell_old_vel_values(this->quad_formula.size());
+
+    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+
+    const FEValuesExtractors::Scalar    phi(0);
+    const FEValuesExtractors::Scalar    eta(1);
+
+    const FEValuesExtractors::Vector    vel(0);
+    
+    auto cell           = this->dof_handler_ch.begin_active();
+    auto cell_stokes    = this->dof_handler_stokes.begin_active();
+    const auto endc     = this->dof_handler_ch.end();
+
+    for(; cell != endc; cell++, cell_stokes++)
+    {
+
+        fe_val_ch.reinit(cell);
+        fe_val_stokes.reinit(cell_stokes);
+
+        local_matrix    = 0;
+        local_rhs       = 0;
+
+        cell->get_dof_indices(local_dof_indices);
+
+        fe_val_ch[phi].get_function_values(
+            this->solution_old_ch,
+            cell_old_phi_values
+        ); 
+        fe_val_ch[phi].get_function_gradients(
+            this->solution_old_ch,
+            cell_old_phi_grad
+        );
+
+        fe_val_stokes[vel].get_function_values(
+            this->solution_stokes,
+            cell_old_vel_values
+        );
+
+
+        for(uint q = 0 ;  q < this->quad_formula.size(); q++)
+        {   
+
+            double          phi_old_x       = cell_old_phi_values[q];
+            Tensor<1,dim>   phi_old_x_grad  = cell_old_phi_grad[q];
+            Tensor<1,dim>   vel_old_x       = cell_old_vel_values[q];
+
+            for(uint k = 0; k < dofs_per_cell; k++)
+            {
+                phi_val[k]  = fe_val_ch[phi].value(k,q);
+                eta_val[k]  = fe_val_ch[eta].value(k,q);
+
+                phi_grad[k] = fe_val_ch[phi].gradient(k,q);
+                eta_grad[k] = fe_val_ch[eta].gradient(k,q);
+            }
+
+            for(uint i = 0; i < dofs_per_cell; i++)
+            {
+                
+                for(uint j = 0; j < dofs_per_cell; j++)
+                {
+                    // (0,0): M
+                    local_matrix(i,j)
+                        +=  phi_val[i] * phi_val[j]
+                        *   fe_val_ch.JxW(q);
+                    
+                    // (0,1): kA
+                    local_matrix(i,j)
+                        +=  this->timestep 
+                        *   phi_grad[i] * eta_grad[j]
+                        *   fe_val_ch.JxW(q);
+
+                    // (1,0): - (2 M + epsilon^2 A)
+                    local_matrix(i,j)
+                        -=  2.0 * eta_val[i] * phi_val[j]
+                            * fe_val_ch.JxW(q);
+
+                    local_matrix(i,j)
+                        -=  pow(this->eps,2)
+                            * eta_grad[i] * phi_grad[j]
+                            * fe_val_ch.JxW(q); 
+ 
+                    // (1,1): M
+                    local_matrix(i,j)
+                        +=  eta_val[i] * eta_val[j] * fe_val_ch.JxW(q);
+                }
+                
+                // <\varphi_i, phi_old>
+                local_rhs(i)    +=  phi_val[i]
+                                *   phi_old_x
+                                *   fe_val_ch.JxW(q);
+
+                // 3 k <\nabla\varphi_i, \nabla\phi_old>
+                local_rhs(i)    +=  3.0 * this->timestep
+                                *   phi_grad[i]
+                                *   phi_old_x_grad 
+                                *   fe_val_ch.JxW(q);
+
+                // - k <\nabla\varphi_i, 3(\phi_old)^2 \nabla\phi_old>
+                local_rhs(i)    -=  this->timestep 
+                                *   (phi_grad[i]
+                                *   3.0 * pow(phi_old_x,2) * phi_old_x_grad)
+                                *   fe_val_ch.JxW(q);
+                
+                // Advection
+                local_rhs(i)    += this->timestep * (
+                                    phi_val[i] *  vel_old_x * phi_old_x_grad
+                                ) * fe_val_ch.JxW(q);
+
+            }
+        }
+
+        this->constraints_ch.distribute_local_to_global(
+            local_matrix,
+            local_rhs,
+            local_dof_indices,
+            this->system_matrix_ch,
+            this->rhs_ch
+        );
+    }
+
+    std::cout << "Assembly completed" << std::endl;
+    
+    // Decomposition of RHS vector
+    auto phi_rhs = this->rhs_ch.block(0);
+    auto eta_rhs = this->rhs_ch.block(1);
+    
+    auto phi_range = std::minmax_element(phi_rhs.begin(),
+                                         phi_rhs.end());
+    auto eta_range = std::minmax_element(eta_rhs.begin(),
+                                         eta_rhs.end());
+
+    std::cout   <<    "   Phi RHS range: (" 
+                << *phi_range.first << ", "
+                << *phi_range.second 
+                << ")" << std::endl;
+    std::cout   <<    "   Eta RHS range: (" 
+                << *eta_range.first << ", "
+                << *eta_range.second 
+                << ")" << std::endl;
+}
+
+template<int dim>
+void SCHSolver<dim>::solveCahnHilliard()
+{
+
+    std::cout << "Solving Cahn-Hilliard system" << std::endl;
+
+    ReductionControl solverControlInner(2000, 1.0e-18, 1.0e-10);
+    SolverCG<Vector<double>>    solverInner(solverControlInner);
+
+    SolverControl               solverControlOuter(
+                                    10000,
+                                    1e-10 * this->rhs_ch.l2_norm()
+                                );
+    SolverGMRES<
+        Vector<double>
+        >    solverOuter(solverControlOuter);
+    
+    // Decomposition of tangent matrix
+    const auto A = linear_operator(this->system_matrix_ch.block(0,0));
+    const auto B = linear_operator(this->system_matrix_ch.block(0,1));
+    const auto C = linear_operator(this->system_matrix_ch.block(1,0));
+    const auto D = linear_operator(this->system_matrix_ch.block(1,1));
+   
+    // Decomposition of solution vector
+    auto phi = this->solution_ch.block(0);
+    auto eta = this->solution_ch.block(1);
+    
+    // Decomposition of RHS vector
+    auto phi_rhs = this->rhs_ch.block(0);
+    auto eta_rhs = this->rhs_ch.block(1);
+    
+    SparseDirectUMFPACK precon_A;
+    precon_A.initialize(this->system_matrix_ch.block(0,0));
+
+    // Construction of inverse of Schur complement
+    const auto A_inv = inverse_operator(A, solverInner, precon_A);
+    const auto S = schur_complement(A_inv,B,C,D);
+     
+    const auto S_inv = inverse_operator(S, solverOuter, 
+                                        this->system_matrix_ch.block(1,1));
+     
+    // Solve reduced block system
+    // PackagedOperation that represents the condensed form of g
+    auto rhs = condense_schur_rhs(A_inv,C, phi_rhs, eta_rhs);
+     
+    // Solve for y
+    eta = S_inv * rhs;
+
+    std::cout << "\tSolved for eta..." << std::endl;
+     
+    // Compute x using resolved solution y
+    phi = postprocess_schur_solution (A_inv, B, eta, phi_rhs);
+
+    std::cout << "\tSolved for phi..." << std::endl;
+
+    auto eta_range = std::minmax_element(eta.begin(),
+                                         eta.end());
+    auto phi_range = std::minmax_element(phi.begin(),
+                                         phi.end());
+
+    std::cout   <<    "   Phi range: (" 
+                << *phi_range.first << ", "
+                << *phi_range.second 
+                << ")" << std::endl;
+    std::cout   <<    "   Eta range: (" 
+                << *eta_range.first << ", "
+                << *eta_range.second 
+                << ")" << std::endl;
+
+    this->solution_ch.block(0) = phi;
+    this->solution_ch.block(1) = eta;
+    this->constraints_ch.distribute(this->solution_ch);
+
+}
+
+template<int dim>
 void SCHSolver<dim>::refineGrid()
 {
     std::cout << "Performing refinement..." << std::endl; 
 
     Vector<float> estimated_error_per_cell(triangulation.n_active_cells());
+
+    FEValuesExtractors::Scalar phi(0);
+    ComponentMask phi_mask = this->fe_ch.component_mask(phi);
 
     KellyErrorEstimator<dim>::estimate(
         this->dof_handler_ch,
@@ -820,14 +1130,31 @@ void SCHSolver<dim>::refineGrid()
         {},
         this->solution_ch,
         estimated_error_per_cell,
-        {}, {}, {}, {}, {},
+        phi_mask, {}, {}, {}, {},
         KellyErrorEstimator<dim>::face_diameter_over_twice_max_degree
     );
-
+    
     GridRefinement::refine_and_coarsen_optimize(
         this->triangulation,
         estimated_error_per_cell
     );
+    
+    KellyErrorEstimator<dim>::estimate(
+        this->dof_handler_stokes,
+        QGauss<dim-1>(degree+1),
+        {},
+        this->solution_stokes,
+        estimated_error_per_cell,
+        {}, {}, {}, {}, {},
+        KellyErrorEstimator<dim>::face_diameter_over_twice_max_degree
+    );
+    
+    GridRefinement::refine_and_coarsen_optimize(
+        this->triangulation,
+        estimated_error_per_cell
+    );
+
+    std::cout << "\tEstimated errors" << std::endl;
 
     // Ensure that we do not refine above or below the min and max refinement
     for(auto & cell : triangulation.active_cell_iterators_on_level(min_grid_level))
@@ -842,28 +1169,31 @@ void SCHSolver<dim>::refineGrid()
         }
     }
 
-    SolutionTransfer<dim, Vector<double>> ch_trans(this->dof_handler_ch);
+    std::cout   << "\tSet refine and coarsen flags\n"
+                << "\tPreparing solution transfer"
+                << std::endl;
 
-    std::vector<Vector<double>> pre_refine_sol(2);
-    pre_refine_sol[0] = this->solution_ch;
-    pre_refine_sol[1] = this->solution_old_ch;
+    SolutionTransfer<dim, BlockVector<double>> ch_trans(this->dof_handler_ch);
+    SolutionTransfer<dim, BlockVector<double>> ch_trans_old(this->dof_handler_ch);
+
+    BlockVector<double> pre_refine_sol_ch;
+    BlockVector<double> pre_refine_sol_old_ch;
+    pre_refine_sol_ch       = this->solution_ch;
+    pre_refine_sol_old_ch   = this->solution_old_ch;
 
     triangulation.prepare_coarsening_and_refinement();
-    ch_trans.prepare_for_coarsening_and_refinement(pre_refine_sol);
+    ch_trans.prepare_for_coarsening_and_refinement(pre_refine_sol_ch);
+    ch_trans_old.prepare_for_coarsening_and_refinement(pre_refine_sol_old_ch);
 
     triangulation.execute_coarsening_and_refinement();
+
+    std::cout << "\tExecuted coarsening and refinement" << std::endl;
 
     this->setupDoFs();
     this->setupLinearSystems();
 
-    std::vector<Vector<double>> tmp(2);
-    tmp[0].reinit(this->solution_ch);
-    tmp[1].reinit(this->solution_old_ch);
-
-    ch_trans.interpolate(pre_refine_sol, tmp);
-
-    this->solution_ch       = tmp[0];
-    this->solution_old_ch   = tmp[1];
+    ch_trans.interpolate(pre_refine_sol_ch, this->solution_ch);
+    ch_trans_old.interpolate(pre_refine_sol_old_ch, this->solution_old_ch);
 
     this->constraints_ch.distribute(this->solution_ch);
     this->constraints_ch.distribute(this->solution_old_ch);
@@ -914,6 +1244,87 @@ void SCHSolver<dim>::outputStokes(const uint timestep_number)
 }
 
 template<int dim>
+void SCHSolver<dim>::outputCahnHilliard(const uint timestep_number)
+{
+    DataOut<dim>    data_out;
+    std::vector<DataComponentInterpretation::DataComponentInterpretation>
+        interpretation(2,DataComponentInterpretation::component_is_scalar);
+    std::vector<std::string> solution_names = {"phi", "eta"};
+    std::vector<std::string> rhs_names = {"phi_rhs", "eta_rhs"};
+    std::vector<std::string> old_names = {"phi_old", "eta_old"};
+
+    data_out.add_data_vector(this->dof_handler_ch,
+                            this->solution_ch,
+                            solution_names,
+                            interpretation);
+    data_out.add_data_vector(this->dof_handler_ch,
+                            this->solution_old_ch,
+                            old_names,
+                            interpretation);
+    data_out.add_data_vector(this->dof_handler_ch,
+                            this->rhs_ch,
+                            rhs_names,
+                            interpretation);
+    data_out.build_patches(this->degree+1);
+
+    const std::string filename = ("ch-solution-" 
+                                 + std::to_string(timestep_number) 
+                                 + ".vtu");
+
+    DataOutBase::VtkFlags vtk_flags;
+    vtk_flags.compression_level = DataOutBase
+        ::VtkFlags
+        ::ZlibCompressionLevel
+        ::best_speed;
+    data_out.set_flags(vtk_flags);
+
+    std::ofstream output(filename);
+    data_out.write_vtu(output);
+}
+
+template<int dim>
+void SCHSolver<dim>::outputTimestep(const uint timestep_number)
+{
+    std::vector<std::string> stokes_names(dim, "velocity");
+    stokes_names.emplace_back("pressure");
+
+    std::vector<
+        DataComponentInterpretation::DataComponentInterpretation
+    > stokes_component_interpretation(
+        dim + 1, DataComponentInterpretation::component_is_scalar
+    );
+    for(uint i = 0; i < dim; i++)
+        stokes_component_interpretation[i] =
+            DataComponentInterpretation::component_is_part_of_vector;
+
+    std::vector<std::string> ch_names = {"phi", "eta"};
+    std::vector<
+        DataComponentInterpretation::DataComponentInterpretation
+    > ch_component_interpretation(
+        2, DataComponentInterpretation::component_is_scalar
+    );
+
+    DataOut<dim> data_out;
+    data_out.add_data_vector(this->dof_handler_stokes,
+                             this->solution_stokes,
+                             stokes_names,
+                             stokes_component_interpretation);
+    data_out.add_data_vector(this->dof_handler_ch,
+                             this->solution_ch,
+                             ch_names,
+                             ch_component_interpretation);
+
+    data_out.build_patches(
+        std::min(this->fe_stokes.degree, this->fe_ch.degree)
+    );
+
+    std::ofstream output("data/solution-" +
+                         Utilities::int_to_string(timestep_number, 4)
+                         + ".vtk");
+    data_out.write_vtk(output);
+}
+
+template<int dim>
 void SCHSolver<dim>::run(
     std::unordered_map<std::string, double> params,
     double                                  total_sim_time)
@@ -926,21 +1337,44 @@ void SCHSolver<dim>::run(
     this->setupLinearSystems();
     
     this->initializeValues();
+    this->assembleStokes();
+    
+    if(debug) this->outputSurfaceTension();
+    
+    this->solveStokes();
 
-    for(uint i = 0; i < 6; i++)
+    for(uint i = 0; i < 4; i++)
     {
 
         this->refineGrid();
         this->initializeValues(); 
+        this->assembleStokes();
+        
+        if(debug) this->outputSurfaceTension();
+        
+        this->solveStokes();
 
     }
-    
-    this->assembleStokes();
-    if(debug) this->outputSurfaceTension();
+   
+    for(uint i = 0; i < 10000; i++)
+    {
+        this->assembleStokes();
+        this->solveStokes();
 
-    this->solveStokes();
-    this->outputStokes(this->timestep_number);
-    timestep_number++;
+        this->assembleCahnHilliard();
+        this->solveCahnHilliard();
+        if(debug) this->outputCahnHilliard(this->timestep_number);
+
+        this->outputTimestep(this->timestep_number);
+
+        this->solution_old_ch = this->solution_ch;
+    
+        std::cout   << "Completed timestep number: " 
+                    << timestep_number
+                    << std::endl;
+
+        timestep_number++;
+    }
 
 }
 
@@ -957,7 +1391,7 @@ int main(){
 
     double total_sim_time = 10;
 
-    stokesCahnHilliard::SCHSolver<2> stokesCahnHilliard(1, true);
+    stokesCahnHilliard::SCHSolver<2> stokesCahnHilliard(1);
     stokesCahnHilliard.run(params, total_sim_time);
 
     std::cout << "Finished running." << std::endl;

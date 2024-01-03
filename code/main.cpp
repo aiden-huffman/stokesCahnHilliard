@@ -5,11 +5,13 @@
 #include <deal.II/base/data_out_base.h>
 #include <deal.II/base/quadrature.h>
 #include <deal.II/base/subscriptor.h>
+#include <deal.II/base/symmetric_tensor.h>
 #include <deal.II/base/tensor.h>
 #include <deal.II/base/types.h>
 #include <deal.II/base/function.h>
 
 #include <deal.II/base/utilities.h>
+#include <deal.II/fe/fe.h>
 #include <deal.II/grid/grid_tools.h>
 #include <deal.II/grid/tria.h>
 #include <deal.II/grid/grid_generator.h>
@@ -209,6 +211,113 @@ namespace LinearSolver
     }
 } // LinearSolver
 
+namespace Assembly
+{
+
+    namespace Scratch
+    {
+    template<int dim>
+    struct StokesPreconditioner
+    {
+    StokesPreconditioner(const FiniteElement<dim> &stokes_fe,
+                         const Quadrature<dim>    &stokes_quad,
+                         const Mapping<dim>       &stokes_mapping,
+                         const UpdateFlags        update_flags);
+
+    StokesPreconditioner(const StokesPreconditioner & data);
+
+    FEValues<dim> stokes_fe_values;
+
+    std::vector<Tensor<2,dim>>  grad_phi_u;
+    std::vector<double>         phi_p;
+    };
+
+    template<int dim>
+    StokesPreconditioner<dim>::StokesPreconditioner(
+        const FiniteElement<dim> &stokes_fe,
+        const Quadrature<dim>    &stokes_quad,
+        const Mapping<dim>       &stokes_mapping,
+        const UpdateFlags        update_flags)
+    : stokes_fe_values(stokes_mapping, stokes_fe, stokes_quad, update_flags)
+    , grad_phi_u(stokes_fe.n_dofs_per_cell())
+    , phi_p(stokes_fe.n_dofs_per_cell())
+    {}
+
+    template<int dim>
+    StokesPreconditioner<dim>::StokesPreconditioner(
+        const StokesPreconditioner &scratch
+    )
+    : stokes_fe_values(scratch.stokes_fe_values.get_mapping(),
+                       scratch.stokes_fe_values.get_fe(),
+                       scratch.stokes_fe_values.get_quadrature(),
+                       scratch.stokes_fe_values.get_update_flags())
+    , grad_phi_u(scratch.grad_phi_u)
+    , phi_p(scratch.phi_p)
+    {}
+
+    template<int dim>
+    struct StokesSystem : public StokesPreconditioner<dim>
+    {
+
+        StokesSystem(const FiniteElement<dim> &stokes_fe,
+                     const Mapping<dim>       &stokes_mapping,
+                     const Quadrature<dim>    &stokes_quad,
+                     const UpdateFlags        stokes_update_flags,
+                     const FiniteElement<dim> &fe_ch,
+                     const UpdateFlags        ch_update_flags);
+
+        StokesSystem(const StokesSystem<dim> &data);
+
+        FEValues<dim>   fe_ch;
+        
+        std::vector<Tensor<1,dim>>          phi_u;
+        std::vector<SymmetricTensor<2,dim>> grad_phi_u;
+        std::vector<double>                 div_phi_u;
+
+        std::vector<double>                 grad_ch;
+        std::vector<Tensor<2,dim>>          outer_grad_ch;
+        
+    };
+
+    template<int dim>
+    StokesSystem<dim>::StokesSystem(
+        const FiniteElement<dim>    &stokes_fe,
+        const Mapping<dim>          &stokes_mapping,
+        const Quadrature<dim>       &stokes_quadrature,
+        const UpdateFlags           stokes_update_flags,
+        const FiniteElement<dim>    &fe_ch,
+        const UpdateFlags           ch_update_flags)
+    : StokesPreconditioner<dim>(stokes_fe,
+                                stokes_mapping,
+                                stokes_quadrature,
+                                stokes_update_flags)
+    , fe_ch(stokes_mapping, fe_ch, stokes_quadrature, ch_update_flags)
+    , phi_u(stokes_fe.n_dofs_per_cell())
+    , grad_phi_u(stokes_fe.n_dofs_per_cell())
+    , div_phi_u(stokes_fe.n_dofs_per_cell())
+    , grad_ch(fe_ch.n_dofs_per_cell())
+    , outer_grad_ch(fe_ch.n_dofs_per_cell())
+    {}
+
+    template<int dim>
+    StokesSystem<dim>::StokesSystem(const StokesSystem<dim> &data)
+    : StokesPreconditioner<dim>(data)
+    , fe_ch(data.fe_ch.get_mapping(),
+            data.fe_ch,
+            data.fe_ch.get_quadrature(),
+            data.fe_ch.get_update_flags())
+    , phi_u(data.phi_u)
+    , grad_phi_u(data.grad_phi_u)
+    , div_phi_u(data.div_phi_u)
+    , grad_ch(data.grad_ch)
+    , outer_grad_ch(data.outer_grad_ch)
+    {}
+
+    }
+
+} // Assembly
+
+
 template<int dim>
 class SCHSolver
     {
@@ -234,14 +343,19 @@ class SCHSolver
         void refineGrid();
 
         void assembleStokes();
-        void outputSurfaceTension();
-        void solveStokes();
-        void outputStokes(const uint timestep_number);
-
+        void assembleStokesLocal();
+        void copyStokesLocalToGlobal();
+        
         void assembleCahnHilliard();
+        void assembleChanHilliardLocal();
+        void copyCahnHilliardLocalToGlobal();
+        
+        void solveStokes();
         void solveCahnHilliard();
-        void outputCahnHilliard(const uint timestep_number);
 
+        void outputSurfaceTension();
+        void outputStokes(const uint timestep_number);
+        void outputCahnHilliard(const uint timestep_number);
         void outputTimestep(const uint timepstep_number);
 
         uint        degree;

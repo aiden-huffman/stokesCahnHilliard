@@ -9,6 +9,7 @@
 #include <deal.II/base/tensor.h>
 #include <deal.II/base/types.h>
 #include <deal.II/base/function.h>
+#include <deal.II/base/work_stream.h>
 
 #include <deal.II/base/utilities.h>
 #include <deal.II/fe/fe.h>
@@ -219,14 +220,13 @@ namespace Assembly
     template<int dim>
     struct StokesPreconditioner
     {
-    StokesPreconditioner(const FiniteElement<dim> &stokes_fe,
-                         const Quadrature<dim>    &stokes_quad,
-                         const Mapping<dim>       &stokes_mapping,
-                         const UpdateFlags        update_flags);
+    StokesPreconditioner(const FiniteElement<dim> &fe_stokes,
+                         const Quadrature<dim>    &quad_stokes,
+                         const UpdateFlags        update_flags_stokes);
 
-    StokesPreconditioner(const StokesPreconditioner & data);
+    StokesPreconditioner(const StokesPreconditioner & scratch);
 
-    FEValues<dim> stokes_fe_values;
+    FEValues<dim> fe_val_stokes;
 
     std::vector<Tensor<2,dim>>  grad_phi_u;
     std::vector<double>         phi_p;
@@ -234,89 +234,346 @@ namespace Assembly
 
     template<int dim>
     StokesPreconditioner<dim>::StokesPreconditioner(
-        const FiniteElement<dim> &stokes_fe,
-        const Quadrature<dim>    &stokes_quad,
-        const Mapping<dim>       &stokes_mapping,
-        const UpdateFlags        update_flags)
-    : stokes_fe_values(stokes_mapping, stokes_fe, stokes_quad, update_flags)
-    , grad_phi_u(stokes_fe.n_dofs_per_cell())
-    , phi_p(stokes_fe.n_dofs_per_cell())
+        const FiniteElement<dim> &fe_stokes,
+        const Quadrature<dim>    &quad_stokes,
+        const UpdateFlags        update_flags_stokes)
+    : fe_val_stokes(fe_stokes, quad_stokes, update_flags_stokes)
+    , grad_phi_u(fe_stokes.n_dofs_per_cell())
+    , phi_p(fe_stokes.n_dofs_per_cell())
     {}
 
     template<int dim>
     StokesPreconditioner<dim>::StokesPreconditioner(
         const StokesPreconditioner &scratch
     )
-    : stokes_fe_values(scratch.stokes_fe_values.get_mapping(),
-                       scratch.stokes_fe_values.get_fe(),
-                       scratch.stokes_fe_values.get_quadrature(),
-                       scratch.stokes_fe_values.get_update_flags())
+    : fe_val_stokes(scratch.fe_val_stokes.get_fe(),
+                    scratch.fe_val_stokes.get_quadrature(),
+                    scratch.fe_val_stokes.get_update_flags())
     , grad_phi_u(scratch.grad_phi_u)
     , phi_p(scratch.phi_p)
     {}
 
     template<int dim>
-    struct StokesSystem : public StokesPreconditioner<dim>
+    struct StokesMatrix : public StokesPreconditioner<dim>
     {
 
-        StokesSystem(const FiniteElement<dim> &stokes_fe,
-                     const Mapping<dim>       &stokes_mapping,
-                     const Quadrature<dim>    &stokes_quad,
-                     const UpdateFlags        stokes_update_flags,
-                     const FiniteElement<dim> &fe_ch,
-                     const UpdateFlags        ch_update_flags);
+        StokesMatrix(const FiniteElement<dim> &fe_stokes,
+                     const Quadrature<dim>    &quad_stokes,
+                     const UpdateFlags        update_flags_stokes);
 
-        StokesSystem(const StokesSystem<dim> &data);
+        StokesMatrix(const StokesMatrix<dim> &scratch);
 
-        FEValues<dim>   fe_ch;
-        
         std::vector<Tensor<1,dim>>          phi_u;
-        std::vector<SymmetricTensor<2,dim>> grad_phi_u;
+        std::vector<SymmetricTensor<2,dim>> symgrad_phi_u;
         std::vector<double>                 div_phi_u;
 
-        std::vector<double>                 grad_ch;
-        std::vector<Tensor<2,dim>>          outer_grad_ch;
-        
     };
 
     template<int dim>
-    StokesSystem<dim>::StokesSystem(
-        const FiniteElement<dim>    &stokes_fe,
-        const Mapping<dim>          &stokes_mapping,
-        const Quadrature<dim>       &stokes_quadrature,
-        const UpdateFlags           stokes_update_flags,
-        const FiniteElement<dim>    &fe_ch,
-        const UpdateFlags           ch_update_flags)
-    : StokesPreconditioner<dim>(stokes_fe,
-                                stokes_mapping,
-                                stokes_quadrature,
-                                stokes_update_flags)
-    , fe_ch(stokes_mapping, fe_ch, stokes_quadrature, ch_update_flags)
-    , phi_u(stokes_fe.n_dofs_per_cell())
-    , grad_phi_u(stokes_fe.n_dofs_per_cell())
-    , div_phi_u(stokes_fe.n_dofs_per_cell())
-    , grad_ch(fe_ch.n_dofs_per_cell())
-    , outer_grad_ch(fe_ch.n_dofs_per_cell())
+    StokesMatrix<dim>::StokesMatrix(
+        const FiniteElement<dim>    &fe_stokes,
+        const Quadrature<dim>       &quad_stokes,
+        const UpdateFlags           update_flags_stokes)
+    : StokesPreconditioner<dim>(fe_stokes,
+                                quad_stokes,
+                                update_flags_stokes)
+    , phi_u(fe_stokes.n_dofs_per_cell())
+    , symgrad_phi_u(fe_stokes.n_dofs_per_cell())
+    , div_phi_u(fe_stokes.n_dofs_per_cell())
     {}
 
     template<int dim>
-    StokesSystem<dim>::StokesSystem(const StokesSystem<dim> &data)
-    : StokesPreconditioner<dim>(data)
-    , fe_ch(data.fe_ch.get_mapping(),
-            data.fe_ch,
-            data.fe_ch.get_quadrature(),
-            data.fe_ch.get_update_flags())
-    , phi_u(data.phi_u)
-    , grad_phi_u(data.grad_phi_u)
-    , div_phi_u(data.div_phi_u)
-    , grad_ch(data.grad_ch)
-    , outer_grad_ch(data.outer_grad_ch)
+    StokesMatrix<dim>::StokesMatrix(const StokesMatrix<dim> &scratch)
+    : StokesPreconditioner<dim>(scratch)
+    , phi_u(scratch.phi_u)
+    , symgrad_phi_u(scratch.symgrad_phi_u)
+    , div_phi_u(scratch.div_phi_u)
+    {}
+
+    template<int dim>
+    struct StokesRHS : public StokesPreconditioner<dim>
+    {
+        StokesRHS(const FiniteElement<dim>  &fe_stokes,
+                  const Quadrature<dim>     &quad_stokes,
+                  const UpdateFlags         update_flags_stokes,
+                  const FiniteElement<dim>  &fe_ch,
+                  const UpdateFlags         update_flags_ch);
+
+        StokesRHS(const StokesRHS<dim>  &scratch);
+
+        FEValues<dim>   fe_val_ch;
+
+        std::vector<Tensor<2,dim>> grad_phi_u;
+
+        std::vector<Tensor<2,dim>> grad_outer_phi_q;
+        std::vector<Tensor<1,dim>> grad_phi_q;
+    };
+
+    template<int dim>
+    StokesRHS<dim> :: StokesRHS(
+        const FiniteElement<dim>  &fe_stokes,
+        const Quadrature<dim>     &quad_stokes,
+        const UpdateFlags         update_flags_stokes,
+        const FiniteElement<dim>  &fe_ch,
+        const UpdateFlags         update_flags_ch
+    ) : StokesPreconditioner<dim>(fe_stokes,
+                                  quad_stokes,
+                                  update_flags_stokes)
+    , fe_val_ch(fe_ch, quad_stokes, update_flags_ch)
+    , grad_phi_u(fe_stokes.n_dofs_per_cell())
+    , grad_outer_phi_q(quad_stokes.size())
+    , grad_phi_q(quad_stokes.size())
+    {}
+
+    template<int dim>
+    StokesRHS<dim> :: StokesRHS(const StokesRHS<dim> &scratch)
+    : StokesPreconditioner<dim>(scratch.fe_val_stokes.get_fe(),
+                                scratch.fe_val_stokes.get_quadrature(),
+                                scratch.fe_val_stokes.get_update_flags())
+    , fe_val_ch(
+        scratch.fe_val_ch.get_fe(),
+        scratch.fe_val_ch.get_quadrature(),
+        scratch.fe_val_ch.get_update_flags())
+    , grad_phi_u(scratch.grad_phi_u)
+    , grad_outer_phi_q(scratch.grad_outer_phi_q)
+    , grad_phi_q(scratch.grad_phi_q)
+    {}
+
+    template<int dim>
+    struct CahnHilliardMatrix
+    {
+
+        CahnHilliardMatrix(const FiniteElement<dim> &fe_ch,
+                           const Quadrature<dim>    &quad_ch,
+                           const UpdateFlags        update_flags_ch);
+
+        CahnHilliardMatrix(const CahnHilliardMatrix<dim> &scratch);
+        
+        FEValues<dim> fe_val_ch;
+        
+        std::vector<double>         phi_val;
+        std::vector<Tensor<1,dim>>  phi_grad;
+        std::vector<double>         eta_val;
+        std::vector<Tensor<1,dim>>  eta_grad;
+
+    };
+    
+    template<int dim>
+    CahnHilliardMatrix<dim> :: CahnHilliardMatrix(
+        const FiniteElement<dim> &fe_ch,
+        const Quadrature<dim>    &quad_ch,
+        const UpdateFlags        update_flags_ch
+    ) : fe_val_ch(fe_ch, quad_ch, update_flags_ch)
+    , phi_val(fe_ch.n_dofs_per_cell())
+    , phi_grad(fe_ch.n_dofs_per_cell())
+    , eta_val(fe_ch.n_dofs_per_cell())
+    , eta_grad(fe_ch.n_dofs_per_cell())
+    {}
+
+    template<int dim>
+    CahnHilliardMatrix<dim> :: CahnHilliardMatrix(
+        const CahnHilliardMatrix<dim> &scratch
+    ) : fe_val_ch(fe_val_ch.get_fe(),
+                  fe_val_ch.get_quad(),
+                  fe_val_ch.get_update_flags())
+    , phi_val(scratch.phi_val)
+    , phi_grad(scratch.phi_grad)
+    , eta_val(scratch.eta_val)
+    , eta_grad(scratch.eta_grad)
+    {}
+
+    template<int dim>
+    struct CahnHilliardRHS
+    {
+        
+        CahnHilliardRHS(const FiniteElement<dim> &fe_ch,
+                        const Quadrature<dim>    &quad_ch,
+                        const UpdateFlags        update_flags_ch,
+                        const FiniteElement<dim> &fe_stokes,
+                        const UpdateFlags        update_flags_stokes);
+        CahnHilliardRHS(const CahnHilliardRHS<dim> &scratch);
+
+        FEValues<dim> fe_val_ch;
+        FEValues<dim> fe_val_stokes;
+
+        std::vector<double>         phi_val;
+        std::vector<Tensor<1,dim>>  phi_grad;
+
+        std::vector<double>         phi_old_q;
+        std::vector<Tensor<1,dim>>  phi_grad_old_q;
+
+        std::vector<Tensor<1,dim>>   vel_old_q;
+ 
+    };
+
+    template<int dim>
+    CahnHilliardRHS<dim> :: CahnHilliardRHS(
+        const FiniteElement<dim> &fe_ch,
+        const Quadrature<dim>    &quad_ch,
+        const UpdateFlags        update_flags_ch,
+        const FiniteElement<dim> &fe_stokes,
+        const UpdateFlags        update_flags_stokes
+    ) : fe_val_ch(fe_ch,
+                  quad_ch,
+                  update_flags_ch)
+    , fe_val_stokes(fe_stokes,
+                    quad_ch,
+                    update_flags_stokes)
+    , phi_val(fe_ch.n_dofs_per_cell())
+    , phi_grad(fe_ch.n_dofs_per_cell())
+    , phi_old_q(quad_ch.size())
+    , phi_grad_old_q(quad_ch.size())
+    , vel_old_q(quad_ch.size())
+    {}
+
+    template<int dim>
+    CahnHilliardRHS<dim> :: CahnHilliardRHS(
+        const CahnHilliardRHS<dim> &scratch
+    ) : fe_val_ch(
+        scratch.fe_val_ch.get_fe(),
+        scratch.fe_val_ch.get_quad(),
+        scratch.fe_val_ch.get_update_flags())
+    , fe_val_stokes(
+        scratch.fe_val_stokes.get_fe(),
+        scratch.fe_val_stokes.get_quad(),
+        scratch.fe_val_stokes.get_update_flags())
+    , phi_val(scratch.phi_val)
+    , phi_grad(scratch.phi_grad)
+    , phi_old_q(scratch.phi_old_q)
+    , phi_grad_old_q(scratch.phi_grad_old_q)
+    , vel_old_q(scratch.vel_old_q)
     {}
 
     }
+   
+    namespace CopyData
+    {
+
+    template<int dim>
+    struct StokesPreconditioner
+    {
+        StokesPreconditioner(const FiniteElement<dim> &fe_stokes);
+        StokesPreconditioner(const StokesPreconditioner<dim> &data);
+        StokesPreconditioner &operator=
+            (const StokesPreconditioner<dim> &)=default;
+
+        FullMatrix<double>                      local_matrix;
+        std::vector<types::global_dof_index>    local_dof_indices;
+    };
+
+    template<int dim>
+    StokesPreconditioner<dim> :: StokesPreconditioner(
+        const FiniteElement<dim> &fe_stokes
+    ) : local_matrix(fe_stokes.n_dofs_per_cell(),
+                     fe_stokes.n_dofs_per_cell())
+    , local_dof_indices(fe_stokes.n_dofs_per_cell())
+    {}
+
+    template<int dim>
+    StokesPreconditioner<dim> :: StokesPreconditioner(
+        const StokesPreconditioner<dim> &data
+    ) : local_matrix(data.local_matrix)
+    , local_dof_indices(data.local_dof_indices)
+    {}
+
+    template<int dim>
+    struct StokesMatrix
+    {
+        StokesMatrix(const FiniteElement<dim> &fe_stokes);
+        StokesMatrix(const StokesMatrix<dim>  &data);
+        StokesMatrix &operator=(const StokesMatrix<dim> &) = default;
+
+        FullMatrix<double>                      local_matrix;
+        std::vector<types::global_dof_index>    local_dof_indices;
+    };
+
+    template<int dim>
+    StokesMatrix<dim> :: StokesMatrix(const FiniteElement<dim> &fe_stokes)
+    : local_matrix(fe_stokes.n_dofs_per_cell(),
+                   fe_stokes.n_dofs_per_cell())
+    , local_dof_indices(fe_stokes.n_dofs_per_cell())
+    {}
+    
+    template<int dim>
+    StokesMatrix<dim> :: StokesMatrix(const StokesMatrix<dim> &data)
+    : local_matrix(data.local_matrix)
+    , local_dof_indices(data.local_dof_indices)
+    {}
+
+    template<int dim>
+    struct StokesRHS
+    {
+        StokesRHS(const FiniteElement<dim> &fe_stokes);
+        StokesRHS(const StokesRHS<dim>  &data);
+        StokesRHS &operator=(const StokesRHS<dim> &) = default;
+
+        Vector<double>                          local_rhs;
+        std::vector<types::global_dof_index>    local_dof_indices;
+    };
+
+    template<int dim>
+    StokesRHS<dim> :: StokesRHS(const FiniteElement<dim> &fe_stokes)
+    : local_rhs(fe_stokes.n_dofs_per_cell())
+    , local_dof_indices(fe_stokes.n_dofs_per_cell())
+    {}
+
+    template<int dim>
+    StokesRHS<dim> :: StokesRHS(const StokesRHS<dim> &data)
+    : local_rhs(data.local_rhs)
+    , local_dof_indices(data.local_dof_indices)
+    {}
+
+    template<int dim>
+    struct CahnHilliardMatrix
+    {
+        CahnHilliardMatrix(const FiniteElement<dim> &fe_ch);
+        CahnHilliardMatrix(const CahnHilliardMatrix<dim> &data);
+        CahnHilliardMatrix &operator=(const CahnHilliardMatrix<dim> &)=default;
+
+        FullMatrix<double>                      local_matrix;
+        std::vector<types::global_dof_index>    local_dof_indices;
+    };
+
+    template<int dim>
+    CahnHilliardMatrix<dim> :: CahnHilliardMatrix(
+        const FiniteElement<dim> &fe_ch
+    ) : local_matrix(fe_ch.n_dofs_per_cell(), fe_ch.n_dofs_per_cell())
+    , local_dof_indices(fe_ch.n_dofs_per_cell())
+    {}
+
+    template<int dim>
+    CahnHilliardMatrix<dim> :: CahnHilliardMatrix(
+        const CahnHilliardMatrix<dim> &data
+    ) : local_matrix(data.local_matrix)
+    , local_dof_indices(data.local_dof_indices)
+    {}
+
+    template<int dim>
+    struct CahnHilliardRHS
+    {
+        CahnHilliardRHS(const FiniteElement<dim> &fe_ch);
+        CahnHilliardRHS(const CahnHilliardRHS<dim> &data);
+        CahnHilliardRHS &operator=(const CahnHilliardRHS<dim> &)=default;
+
+        Vector<double>                          local_rhs;
+        std::vector<types::global_dof_index>    local_dof_indices;
+    };
+
+    template<int dim>
+    CahnHilliardRHS<dim> :: CahnHilliardRHS(const FiniteElement<dim> &fe_ch)
+    : local_rhs(fe_ch.n_dofs_per_cell())
+    , local_dof_indices(fe_ch.n_dofs_per_cell())
+    {}
+
+    template<int dim>
+    CahnHilliardRHS<dim> :: CahnHilliardRHS(const CahnHilliardRHS<dim> &data)
+    : local_rhs(data.local_rhs)
+    , local_dof_indices(data.local_rhs)
+    {}
+
+    } // CopyData
 
 } // Assembly
-
 
 template<int dim>
 class SCHSolver
@@ -342,13 +599,45 @@ class SCHSolver
         void initializeValues();
         void refineGrid();
 
-        void assembleStokes();
-        void assembleStokesLocal();
-        void copyStokesLocalToGlobal();
-        
+        // Local assembly
+        void assembleStokesPreconLocal(
+            const typename DoFHandler<dim>::active_cell_iterator &cell,
+            Assembly::Scratch::StokesPreconditioner<dim>&        scratch,
+            Assembly::CopyData::StokesPreconditioner<dim>&       data
+        );
+        void assembleStokesMatrixLocal(
+            const typename DoFHandler<dim>::active_cell_iterator &cell,
+            Assembly::Scratch::StokesMatrix<dim>&        scratch,
+            Assembly::CopyData::StokesMatrix<dim>&       data
+        );
+        void assembleStokesRHSLocal(
+            const typename DoFHandler<dim>::active_cell_iterator &cell,
+            Assembly::Scratch::StokesRHS<dim>&        scratch,
+            Assembly::CopyData::StokesRHS<dim>&       data
+        );
+
+        // Copiers
+        void copyStokesPreconLocalToGlobal(
+            const Assembly::CopyData::StokesPreconditioner<dim> & data
+        );
+        void copyStokesMatrixLocalToGlobal(
+            const Assembly::CopyData::StokesMatrix<dim> & data
+        );
+        void copyStokesRHSLocalToGlobal(
+            const Assembly::CopyData::StokesRHS<dim> &data
+        );
+
+        // Assembly
+        void assembleStokesPrecon();
+        void assembleStokesMatrix();
+        void assembleStokesRHS();
         void assembleCahnHilliard();
-        void assembleChanHilliardLocal();
-        void copyCahnHilliardLocalToGlobal();
+
+        void assembleCahnHilliardMatrixLocal();
+        void assembleCahnHilliardRHSLocal();
+
+        void copyCahnHilliardMatrixLocalToGlobal();
+        void copyCahnHilliardRHSLocalToGlobal();
         
         void solveStokes();
         void solveCahnHilliard();
@@ -413,7 +702,7 @@ SCHSolver<dim>::SCHSolver(const uint degree, const bool debug,
 , quad_formula(degree+2)
 , dof_handler_stokes(triangulation)
 , dof_handler_ch(triangulation)
-, timestep(1e-2)
+, timestep(1e-4)
 , time(timestep)
 , timestep_number(1)
 , debug(debug)
@@ -767,140 +1056,310 @@ void SCHSolver<dim>::initializeValues()
 }
 
 template<int dim>
-void SCHSolver<dim>::assembleStokes()
+void SCHSolver<dim>::assembleStokesPreconLocal(
+    const typename DoFHandler<dim>::active_cell_iterator &cell,
+    Assembly::Scratch::StokesPreconditioner<dim>&        scratch,
+    Assembly::CopyData::StokesPreconditioner<dim>&       data
+)
 {
-    std::cout << "Constructing Stokes system" << std::endl;
+    const uint dofs_per_cell =
+        scratch.fe_val_stokes.get_fe().n_dofs_per_cell();
+    const uint n_q_points =
+        scratch.fe_val_stokes.get_quadrature().size();
 
-    this->system_matrix_stokes  = 0;
-    this->rhs_stokes            = 0;
+    scratch.fe_val_stokes.reinit(cell);
+    cell->get_dof_indices(data.local_dof_indices);
 
-    FEValues fe_val_stokes(
-        this->fe_stokes,
-        this->quad_formula,
-        update_values |
-        update_JxW_values |
-        update_gradients
-    );
-    FEValues fe_val_ch(
-        this->fe_ch,
-        this->quad_formula,
-        update_values |
-        update_gradients |
-        update_JxW_values
-    );
+    data.local_matrix = 0;
 
-    const uint dofs_per_cell    = this->fe_stokes.n_dofs_per_cell();
-    const uint n_q_points       = this->quad_formula.size();
-
-    FullMatrix<double> local_matrix(
-        dofs_per_cell,
-        dofs_per_cell
-    );
-    
-    FullMatrix<double> local_precon_matrix(
-        dofs_per_cell,
-        dofs_per_cell
-    );
-
-    Vector<double> local_rhs(dofs_per_cell);
-
-    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-    
-    std::vector<SymmetricTensor<2, dim>> symgrad_phi_u(dofs_per_cell);
-    std::vector<double>                  div_phi_u(dofs_per_cell);
-    std::vector<Tensor<1, dim>>          phi_u(dofs_per_cell);
-    std::vector<double>                  phi_p(dofs_per_cell);
-    
-    std::vector<Tensor<1,dim>>  grad_phi_cell(n_q_points);
-    std::vector<Tensor<2, dim>> grad_outer_phi(n_q_points);
-    
-    auto cell       = this->dof_handler_stokes.begin_active();
-    auto cell_ch    = this->dof_handler_ch.begin_active();
-    const auto endc = this->dof_handler_stokes.end();
-    
-    const FEValuesExtractors::Vector velocities(0);
-    const FEValuesExtractors::Scalar pressure(dim);
-    const FEValuesExtractors::Scalar phi(0);
-
-    for(; cell != endc; cell++, cell_ch++)
+    for(uint q = 0; q < n_q_points; q++)
     {
-        fe_val_stokes.reinit(cell);
-        fe_val_ch.reinit(cell_ch);
 
-        local_precon_matrix = 0;
-        local_matrix    = 0;
-        local_rhs       = 0;
-
-        cell->get_dof_indices(local_dof_indices);
-
-        fe_val_ch[phi].get_function_gradients(this->solution_old_ch,
-                                              grad_phi_cell);
-
-        // Construct \nabla \phi \otimes \nabla \phi
-        for(uint q = 0; q < n_q_points; q++)
+        for(uint k = 0; k < n_q_points; k++)
         {
-            for(uint i = 0; i < dim; i++)
-            {
-                for(uint j = 0; j < dim; j++)
-                {
-                    grad_outer_phi[q][i][j] = -grad_phi_cell[q][i] 
-                                            * grad_phi_cell[q][j];
-                    
-                    if (i == j) grad_outer_phi[q][i][j] 
-                        += std::pow(grad_phi_cell[q].norm(),2);
-                }
-            }
+            scratch.phi_p[k] = scratch.fe_val_stokes.shape_value(k, q);
         }
 
-        for(uint q = 0; q < n_q_points; q++)
+        for(uint i = 0; i < dofs_per_cell; i++)
         {
-
-            for(uint k = 0; k < dofs_per_cell; k++)
+            for(uint j = 0; j < dofs_per_cell; j++)
             {
-                symgrad_phi_u[k] =
-                    fe_val_stokes[velocities].symmetric_gradient(k,q);
-                div_phi_u[k]    = fe_val_stokes[velocities].divergence(k,q);
-                phi_u[k]        = fe_val_stokes[velocities].value(k,q);
-                phi_p[k]        = fe_val_stokes[pressure].value(k,q);
-
-            }
-
-
-            for(uint i = 0; i < dofs_per_cell; i++)
-            {
-                for(uint j = 0; j < dofs_per_cell; j++)
-                {
-                    local_matrix(i,j) +=
-                        (2 * (symgrad_phi_u[i] * symgrad_phi_u[j])
-                         - div_phi_u[i] * phi_p[j]
-                         - phi_p[i] * div_phi_u[j])
-                        * fe_val_stokes.JxW(q);
-
-                    local_precon_matrix(i,j) += 
-                        (phi_p[i] * phi_p[j]) * fe_val_stokes.JxW(q);
-                }
-
-                local_rhs(i) += -24 * std::sqrt(2) * this->eps * 1e-2
-                    * scalar_product(fe_val_stokes[velocities].gradient(i,q),
-                                     grad_outer_phi[q])
-                    * fe_val_stokes.JxW(q);
+                data.local_matrix(i,j) +=
+                    scratch.phi_p[i] * scratch.phi_p[j]
+                    * scratch.fe_val_stokes.JxW(q);
             }
         }
-
-        this->constraints_stokes.distribute_local_to_global(
-            local_matrix,
-            local_rhs,
-            local_dof_indices,
-            this->system_matrix_stokes,
-            this->rhs_stokes
-        );
-
-        this->constraints_stokes.distribute_local_to_global(
-            local_precon_matrix,
-            local_dof_indices,
-            this->system_matrix_precon
-        );
     }
+}
+
+template<int dim>
+void SCHSolver<dim>::copyStokesPreconLocalToGlobal(
+    const Assembly::CopyData::StokesPreconditioner<dim> &data
+)
+{
+    this->constraints_stokes.distribute_local_to_global(
+        data.local_matrix,
+        data.local_dof_indices,
+        this->system_matrix_precon
+    );
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleStokesPrecon()
+{
+
+    std::cout << "Assembling Stokes preconditioner..." << std::endl;
+
+    this->system_matrix_precon = 0;
+
+    auto worker = [this](
+        const typename DoFHandler<dim>::active_cell_iterator &cell,
+        Assembly::Scratch::StokesPreconditioner<dim>&        scratch,
+        Assembly::CopyData::StokesPreconditioner<dim>&       data)
+    {
+        this->assembleStokesPreconLocal(cell, scratch, data);
+    };
+
+    auto copier = [this](const Assembly::CopyData::StokesPreconditioner<dim> &data)
+    {
+        this->copyStokesPreconLocalToGlobal(data);
+    };
+
+    WorkStream::run(
+        dof_handler_stokes.begin_active(),
+        dof_handler_stokes.end(),
+        worker,
+        copier,
+        Assembly::Scratch::StokesPreconditioner<dim>(
+            this->fe_stokes,
+            this->quad_formula,
+            update_values | update_JxW_values),
+        Assembly::CopyData::StokesPreconditioner<dim>(
+            this->fe_stokes
+        )
+    );
+
+    std::cout << "Compeleted" << std::endl;
+
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleStokesMatrixLocal(
+    const typename DoFHandler<dim>::active_cell_iterator &cell,
+    Assembly::Scratch::StokesMatrix<dim>&        scratch,
+    Assembly::CopyData::StokesMatrix<dim>&       data
+)
+{
+
+    data.local_matrix = 0;
+
+    scratch.fe_val_stokes.reinit(cell);
+
+    const uint dofs_per_cell =
+        scratch.fe_val_stokes.get_fe().n_dofs_per_cell();
+    const uint n_q_points =
+        scratch.fe_val_stokes.get_quadrature().size();
+
+    cell->get_dof_indices(data.local_dof_indices);
+
+    FEValuesExtractors::Vector velocities(0);
+    FEValuesExtractors::Scalar pressure(dim);
+
+    for(uint q = 0; q < n_q_points; q++)
+    {
+
+        for(uint k = 0; k < dofs_per_cell; k++)
+        {
+            scratch.symgrad_phi_u[k] = 
+                scratch.fe_val_stokes[velocities].symmetric_gradient(k,q);
+            scratch.div_phi_u[k] =
+                scratch.fe_val_stokes[velocities].divergence(k,q);
+
+            scratch.phi_u[k] = scratch.fe_val_stokes[velocities].value(k,q);
+            scratch.phi_p[k] = scratch.fe_val_stokes[pressure].value(k,q);
+
+        }
+
+        for(uint i = 0; i < dofs_per_cell; i++)
+        {
+            for(uint j = 0; j < dofs_per_cell; j++)
+            {
+                    data.local_matrix(i,j) +=
+                        (2 * (scratch.symgrad_phi_u[i] * scratch.symgrad_phi_u[j])
+                         - scratch.div_phi_u[i] * scratch.phi_p[j]
+                         - scratch.phi_p[i] * scratch.div_phi_u[j])
+                        * scratch.fe_val_stokes.JxW(q);
+            }
+        }
+
+    }
+}
+
+template<int dim>
+void SCHSolver<dim>::copyStokesMatrixLocalToGlobal(
+    const Assembly::CopyData::StokesMatrix<dim> &data
+)
+{
+    this->constraints_stokes.distribute_local_to_global(
+        data.local_matrix,
+        data.local_dof_indices,
+        this->system_matrix_stokes
+    );
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleStokesMatrix()
+{
+    std::cout << "Assembling Stokes matrix" << std::endl;
+
+    this->system_matrix_stokes = 0;
+
+    auto worker = [this](
+        const typename DoFHandler<dim>::active_cell_iterator    &cell,
+        Assembly::Scratch::StokesMatrix<dim>            &scratch,
+        Assembly::CopyData::StokesMatrix<dim>           &data)
+    {
+        this->assembleStokesMatrixLocal(cell, scratch, data);
+    };
+
+    auto copier = [this](
+        const Assembly::CopyData::StokesMatrix<dim> &data
+    ) {
+        this->copyStokesMatrixLocalToGlobal(data);
+    };
+    
+    WorkStream::run(
+        dof_handler_stokes.begin_active(),
+        dof_handler_stokes.end(),
+        worker,
+        copier,
+        Assembly::Scratch::StokesMatrix<dim>(
+            this->fe_stokes,
+            this->quad_formula,
+            update_values | update_JxW_values |
+            update_gradients),
+        Assembly::CopyData::StokesMatrix<dim>(
+            this->fe_stokes
+        )
+    );
+
+    std::cout << "Completed" << std::endl;
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleStokesRHSLocal(
+    const typename DoFHandler<dim>::active_cell_iterator &cell,
+    Assembly::Scratch::StokesRHS<dim>&        scratch,
+    Assembly::CopyData::StokesRHS<dim>&       data
+)
+{
+    data.local_rhs = 0;
+    scratch.fe_val_stokes.reinit(cell);
+
+    typename DoFHandler<dim>::active_cell_iterator cell_ch(
+        &this->triangulation, cell->level(), cell->index(), &this->dof_handler_ch
+    );
+    scratch.fe_val_ch.reinit(cell_ch);
+
+    cell->get_dof_indices(data.local_dof_indices);
+
+    const uint dofs_per_cell = scratch.fe_val_stokes.get_fe().n_dofs_per_cell();
+    const uint n_q_points    = scratch.fe_val_stokes.get_quadrature().size();
+
+    FEValuesExtractors::Vector  velocities(0);
+    FEValuesExtractors::Scalar  pressure(dim);
+    FEValuesExtractors::Scalar  phi(0);
+
+    scratch.fe_val_ch[phi].get_function_gradients(
+        this->solution_old_ch,
+        scratch.grad_phi_q
+    );
+
+    for(uint q = 0; q < n_q_points; q++)
+    {
+        // Build outer product
+        for(uint i = 0; i < dim; i++)
+        {
+            for(uint j = 0; j < dim; j++)
+            {
+                scratch.grad_outer_phi_q[q][i][j] =
+                    -scratch.grad_phi_q[q][i] * scratch.grad_phi_q[q][j];
+
+                if(i == j) scratch.grad_outer_phi_q[q][i][j]
+                    += std::pow(scratch.grad_phi_q[q].norm(),2);
+            }
+        }
+
+        for(uint k = 0; k < dofs_per_cell; k++)
+        {
+            scratch.grad_phi_u[k] 
+                = scratch.fe_val_stokes[velocities].gradient(k,q);
+        }
+
+        for(uint i = 0; i < dofs_per_cell; i++)
+        {
+            data.local_rhs(i) +=
+                -24 * std::sqrt(2) * this->eps * 1e-2
+                * scalar_product(scratch.grad_phi_u[i],
+                                 scratch.grad_outer_phi_q[q])
+                * scratch.fe_val_stokes.JxW(q);
+        }
+    }
+    
+}
+
+template<int dim>
+void SCHSolver<dim>::copyStokesRHSLocalToGlobal(
+    const Assembly::CopyData::StokesRHS<dim> &data
+)
+{
+    this->constraints_stokes.distribute_local_to_global(
+        data.local_rhs,
+        data.local_dof_indices,
+        this->rhs_stokes
+    );
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleStokesRHS()
+{
+    std::cout << "Assembling Stokes right hand side" << std::endl;
+
+    this->rhs_stokes = 0;
+
+    auto worker = [this](
+        const typename DoFHandler<dim>::active_cell_iterator    &cell,
+        Assembly::Scratch::StokesRHS<dim>            &scratch,
+        Assembly::CopyData::StokesRHS<dim>           &data)
+    {
+        this->assembleStokesRHSLocal(cell, scratch, data);
+    };
+
+    auto copier = [this](
+        const Assembly::CopyData::StokesRHS<dim> &data
+    ) {
+        this->copyStokesRHSLocalToGlobal(data);
+    };
+    
+    WorkStream::run(
+        dof_handler_stokes.begin_active(),
+        dof_handler_stokes.end(),
+        worker,
+        copier,
+        Assembly::Scratch::StokesRHS<dim>(
+            this->fe_stokes,
+            this->quad_formula,
+            update_values | update_JxW_values |
+            update_gradients,
+            this->fe_ch,
+            update_values | update_JxW_values |
+            update_gradients),
+        Assembly::CopyData::StokesRHS<dim>(
+            this->fe_stokes
+        )
+    );
+
+    std::cout << "Completed" << std::endl;
 }
 
 template<int dim>
@@ -1451,7 +1910,9 @@ void SCHSolver<dim>::run(
     this->setupLinearSystems();
     
     this->initializeValues();
-    this->assembleStokes();
+    this->assembleStokesPrecon();
+    this->assembleStokesMatrix();
+    this->assembleStokesRHS();
     
     if(debug) this->outputSurfaceTension();
     
@@ -1461,8 +1922,10 @@ void SCHSolver<dim>::run(
     {
 
         this->refineGrid();
-        this->initializeValues(); 
-        this->assembleStokes();
+        this->initializeValues();
+        this->assembleStokesPrecon();
+        this->assembleStokesMatrix();
+        this->assembleStokesRHS();
         
         if(debug) this->outputSurfaceTension();
         
@@ -1472,22 +1935,23 @@ void SCHSolver<dim>::run(
    
     for(uint i = 0; i < 10000; i++)
     {
-        this->assembleStokes();
+        this->assembleStokesRHS();
         this->solveStokes();
 
         this->assembleCahnHilliard();
         this->solveCahnHilliard();
-        if(debug) this->outputCahnHilliard(this->timestep_number);
+ 
+        if (i % 100 == 0){
+            this->outputTimestep(this->timestep_number);
+            
+            std::cout   << "Completed timestep number: " 
+                        << timestep_number
+                        << std::endl;
 
-        this->outputTimestep(this->timestep_number);
-
+            timestep_number++;
+        }
+        
         this->solution_old_ch = this->solution_ch;
-    
-        std::cout   << "Completed timestep number: " 
-                    << timestep_number
-                    << std::endl;
-
-        timestep_number++;
     }
 
 }
@@ -1505,7 +1969,7 @@ int main(){
 
     double total_sim_time = 10;
 
-    stokesCahnHilliard::SCHSolver<2> stokesCahnHilliard(1);
+    stokesCahnHilliard::SCHSolver<2> stokesCahnHilliard(1, true);
     stokesCahnHilliard.run(params, total_sim_time);
 
     std::cout << "Finished running." << std::endl;

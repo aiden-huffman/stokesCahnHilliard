@@ -373,9 +373,9 @@ namespace Assembly
     template<int dim>
     CahnHilliardMatrix<dim> :: CahnHilliardMatrix(
         const CahnHilliardMatrix<dim> &scratch
-    ) : fe_val_ch(fe_val_ch.get_fe(),
-                  fe_val_ch.get_quad(),
-                  fe_val_ch.get_update_flags())
+    ) : fe_val_ch(scratch.fe_val_ch.get_fe(),
+                  scratch.fe_val_ch.get_quadrature(),
+                  scratch.fe_val_ch.get_update_flags())
     , phi_val(scratch.phi_val)
     , phi_grad(scratch.phi_grad)
     , eta_val(scratch.eta_val)
@@ -431,11 +431,11 @@ namespace Assembly
         const CahnHilliardRHS<dim> &scratch
     ) : fe_val_ch(
         scratch.fe_val_ch.get_fe(),
-        scratch.fe_val_ch.get_quad(),
+        scratch.fe_val_ch.get_quadrature(),
         scratch.fe_val_ch.get_update_flags())
     , fe_val_stokes(
         scratch.fe_val_stokes.get_fe(),
-        scratch.fe_val_stokes.get_quad(),
+        scratch.fe_val_stokes.get_quadrature(),
         scratch.fe_val_stokes.get_update_flags())
     , phi_val(scratch.phi_val)
     , phi_grad(scratch.phi_grad)
@@ -568,7 +568,7 @@ namespace Assembly
     template<int dim>
     CahnHilliardRHS<dim> :: CahnHilliardRHS(const CahnHilliardRHS<dim> &data)
     : local_rhs(data.local_rhs)
-    , local_dof_indices(data.local_rhs)
+    , local_dof_indices(data.local_dof_indices)
     {}
 
     } // CopyData
@@ -633,11 +633,26 @@ class SCHSolver
         void assembleStokesRHS();
         void assembleCahnHilliard();
 
-        void assembleCahnHilliardMatrixLocal();
-        void assembleCahnHilliardRHSLocal();
+        void assembleCahnHilliardMatrixLocal(
+            const typename DoFHandler<dim>::active_cell_iterator &cell,
+            Assembly::Scratch::CahnHilliardMatrix<dim>           &scratch,
+            Assembly::CopyData::CahnHilliardMatrix<dim>          &data
+        );
+        void assembleCahnHilliardRHSLocal(
+            const typename DoFHandler<dim>::active_cell_iterator &cell,
+            Assembly::Scratch::CahnHilliardRHS<dim>              &scratch,
+            Assembly::CopyData::CahnHilliardRHS<dim>             &data
+        );
 
-        void copyCahnHilliardMatrixLocalToGlobal();
-        void copyCahnHilliardRHSLocalToGlobal();
+        void copyCahnHilliardMatrixLocalToGlobal(
+            const Assembly::CopyData::CahnHilliardMatrix<dim> &data
+        );
+        void copyCahnHilliardRHSLocalToGlobal(
+            const Assembly::CopyData::CahnHilliardRHS<dim> &data
+        );
+
+        void assembleCahnHilliardMatrix();
+        void assembleCahnHilliardRHS();
         
         void solveStokes();
         void solveCahnHilliard();
@@ -1257,7 +1272,8 @@ void SCHSolver<dim>::assembleStokesRHSLocal(
     scratch.fe_val_stokes.reinit(cell);
 
     typename DoFHandler<dim>::active_cell_iterator cell_ch(
-        &this->triangulation, cell->level(), cell->index(), &this->dof_handler_ch
+        &this->triangulation, cell->level(),
+        cell->index(), &this->dof_handler_ch
     );
     scratch.fe_val_ch.reinit(cell_ch);
 
@@ -1433,165 +1449,261 @@ void SCHSolver<dim>::solveStokes()
 }
 
 template<int dim>
+void SCHSolver<dim>::assembleCahnHilliardMatrixLocal(
+    const typename DoFHandler<dim>::active_cell_iterator &cell,
+    Assembly::Scratch::CahnHilliardMatrix<dim>           &scratch,
+    Assembly::CopyData::CahnHilliardMatrix<dim>          &data
+)
+{
+
+    data.local_matrix = 0;
+
+    scratch.fe_val_ch.reinit(cell);
+
+    cell->get_dof_indices(data.local_dof_indices);
+
+    uint dofs_per_cell  = scratch.fe_val_ch.get_fe().n_dofs_per_cell();
+    uint n_q_points     = scratch.fe_val_ch.get_quadrature().size();
+
+    FEValuesExtractors::Scalar  phi(0);
+    FEValuesExtractors::Scalar  eta(1);
+
+    for(uint q = 0; q < n_q_points; q++)
+    {
+
+        for(uint k = 0; k < dofs_per_cell; k++)
+        {
+            scratch.phi_val[k]  = scratch.fe_val_ch[phi].value(k,q);
+            scratch.eta_val[k]  = scratch.fe_val_ch[eta].value(k,q);
+
+            scratch.phi_grad[k] = scratch.fe_val_ch[phi].gradient(k,q);
+            scratch.eta_grad[k] = scratch.fe_val_ch[eta].gradient(k,q);
+        }
+
+        for(uint i = 0; i < dofs_per_cell; i++)
+        {
+            for(uint j = 0; j < dofs_per_cell; j++)
+            {
+                // (0,0): M
+                data.local_matrix(i,j)
+                    +=  scratch.phi_val[i] * scratch.phi_val[j]
+                    *   scratch.fe_val_ch.JxW(q);
+                
+                // (0,1): kA
+                data.local_matrix(i,j)
+                    +=  this->timestep 
+                    *   scratch.phi_grad[i] * scratch.eta_grad[j]
+                    *   scratch.fe_val_ch.JxW(q);
+
+                // (1,0): - (2 M + epsilon^2 A)
+                data.local_matrix(i,j)
+                    -=  2.0 * scratch.eta_val[i] * scratch.phi_val[j]
+                        * scratch.fe_val_ch.JxW(q);
+
+                data.local_matrix(i,j)
+                    -=  pow(this->eps,2)
+                        * scratch.eta_grad[i] * scratch.phi_grad[j]
+                        * scratch.fe_val_ch.JxW(q); 
+
+                // (1,1): M
+                data.local_matrix(i,j)
+                    +=  scratch.eta_val[i] * scratch.eta_val[j] 
+                    * scratch.fe_val_ch.JxW(q);
+            }
+        }
+    }
+
+}
+
+template<int dim>
+void SCHSolver<dim>::copyCahnHilliardMatrixLocalToGlobal(
+    const Assembly::CopyData::CahnHilliardMatrix<dim> &data
+)
+{
+    this->constraints_ch.distribute_local_to_global(
+        data.local_matrix,
+        data.local_dof_indices,
+        this->system_matrix_ch
+    );
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleCahnHilliardMatrix()
+{
+
+    std::cout << "Assembling Cahn-Hilliard matrix" << std::endl;
+
+    this->system_matrix_ch = 0;
+
+    auto worker = [this](
+        const typename DoFHandler<dim>::active_cell_iterator    &cell,
+        Assembly::Scratch::CahnHilliardMatrix<dim>              &scratch,
+        Assembly::CopyData::CahnHilliardMatrix<dim>             &data)
+    {
+        this->assembleCahnHilliardMatrixLocal(cell, scratch, data);
+    };
+
+    auto copier = [this](
+        const Assembly::CopyData::CahnHilliardMatrix<dim> &data
+    ) {
+        this->copyCahnHilliardMatrixLocalToGlobal(data);
+    };
+
+    std::cout << "Beginning work stream" << std::endl;
+    
+    WorkStream::run(
+        dof_handler_ch.begin_active(),
+        dof_handler_ch.end(),
+        worker,
+        copier,
+        Assembly::Scratch::CahnHilliardMatrix<dim>(
+            this->fe_ch,
+            this->quad_formula,
+            update_values | update_JxW_values |
+            update_gradients),
+        Assembly::CopyData::CahnHilliardMatrix<dim>(
+            this->fe_ch
+        )
+    );
+
+    std::cout << "Completed" << std::endl;
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
+    const typename DoFHandler<dim>::active_cell_iterator &cell,
+    Assembly::Scratch::CahnHilliardRHS<dim>              &scratch,
+    Assembly::CopyData::CahnHilliardRHS<dim>             &data
+)
+{
+    data.local_rhs = 0;
+    scratch.fe_val_ch.reinit(cell);
+
+    typename DoFHandler<dim>::active_cell_iterator cell_stokes(
+        &this->triangulation, cell->level(),
+        cell->index(), &this->dof_handler_stokes
+    );
+    scratch.fe_val_stokes.reinit(cell_stokes);
+
+    cell->get_dof_indices(data.local_dof_indices);
+
+
+    const uint dofs_per_cell = scratch.fe_val_ch.get_fe().n_dofs_per_cell();
+    const uint n_q_points    = scratch.fe_val_ch.get_quadrature().size();
+
+    FEValuesExtractors::Vector  velocities(0);
+    FEValuesExtractors::Scalar  phi(0);
+
+    scratch.fe_val_ch[phi].get_function_values(
+        this->solution_old_ch,
+        scratch.phi_old_q
+    ); 
+    scratch.fe_val_ch[phi].get_function_gradients(
+        this->solution_old_ch,
+        scratch.phi_grad_old_q
+    );
+
+    scratch.fe_val_stokes[velocities].get_function_values(
+        this->solution_stokes,
+        scratch.vel_old_q
+    );
+
+    for(uint q = 0; q < n_q_points; q++)
+    {
+        for(uint i = 0; i < dofs_per_cell; i++)
+        { 
+            // <\varphi_i, phi_old>
+            data.local_rhs(i)    +=  scratch.fe_val_ch[phi].value(i,q)
+                            *   scratch.phi_old_q[q]
+                            *   scratch.fe_val_ch.JxW(q);
+
+            // 3 k <\nabla\varphi_i, \nabla\phi_old>
+            data.local_rhs(i)    +=  3.0 * this->timestep
+                            *   scratch.fe_val_ch[phi].gradient(i, q)
+                            *   scratch.phi_grad_old_q[q]
+                            *   scratch.fe_val_ch.JxW(q);
+
+            // - k <\nabla\varphi_i, 3(\phi_old)^2 \nabla\phi_old>
+            data.local_rhs(i)    -=  this->timestep * (
+                                    scratch.fe_val_ch[phi].gradient(i,q)
+                                    * 3.0 * pow(scratch.phi_old_q[q],2) 
+                                    * scratch.phi_grad_old_q[q]
+                                 ) * scratch.fe_val_ch.JxW(q);
+            
+            // Advection
+            data.local_rhs(i)    += this->timestep * (
+                                    scratch.fe_val_ch[phi].value(i,q) 
+                                    * scratch.vel_old_q[q] 
+                                    * scratch.phi_grad_old_q[q]
+                                 ) * scratch.fe_val_ch.JxW(q);
+        }
+    }
+
+}
+
+template<int dim>
+void SCHSolver<dim>::copyCahnHilliardRHSLocalToGlobal(
+    const Assembly::CopyData::CahnHilliardRHS<dim> &data
+)
+{
+    this->constraints_ch.distribute_local_to_global(
+        data.local_rhs,
+        data.local_dof_indices,
+        this->rhs_ch
+    );
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleCahnHilliardRHS()
+{
+    std::cout << "Assembling Cahn-Hilliard right hand side" << std::endl;
+
+    this->rhs_ch = 0;
+
+    auto worker = [this](
+        const typename DoFHandler<dim>::active_cell_iterator    &cell,
+        Assembly::Scratch::CahnHilliardRHS<dim>              &scratch,
+        Assembly::CopyData::CahnHilliardRHS<dim>             &data)
+    {
+        this->assembleCahnHilliardRHSLocal(cell, scratch, data);
+    };
+
+    auto copier = [this](
+        const Assembly::CopyData::CahnHilliardRHS<dim> &data
+    ) {
+        this->copyCahnHilliardRHSLocalToGlobal(data);
+    };
+
+    std::cout << "Beginning work stream" << std::endl;
+    
+    WorkStream::run(
+        dof_handler_ch.begin_active(),
+        dof_handler_ch.end(),
+        worker,
+        copier,
+        Assembly::Scratch::CahnHilliardRHS<dim>(
+            this->fe_ch,
+            this->quad_formula,
+            update_values | update_JxW_values |
+            update_gradients,
+            this->fe_stokes,
+            update_values | update_JxW_values),
+        Assembly::CopyData::CahnHilliardRHS<dim>(
+            this->fe_ch
+        )
+    );
+
+    std::cout << "Completed" << std::endl;
+}
+
+template<int dim>
 void SCHSolver<dim>::assembleCahnHilliard()
 {
 
     std::cout << "Assembling Cahn-Hilliard system" << std::endl;
-
-    this->system_matrix_ch  = 0;
-    this->rhs_ch            = 0;
     
-    FEValues fe_val_stokes(
-        this->fe_stokes,
-        this->quad_formula,
-        update_values |
-        update_JxW_values
-    );
-    FEValues fe_val_ch(
-        this->fe_ch,
-        this->quad_formula,
-        update_values |
-        update_gradients |
-        update_JxW_values
-    );
-
-    const unsigned int dofs_per_cell = this->fe_ch.n_dofs_per_cell();
-
-    FullMatrix<double>  local_matrix(
-        dofs_per_cell, 
-        dofs_per_cell
-    );
-    Vector<double>      local_rhs(dofs_per_cell);
-
-    std::vector<double>         phi_val(dofs_per_cell);
-    std::vector<Tensor<1,dim>>  phi_grad(dofs_per_cell);
-    std::vector<double>         eta_val(dofs_per_cell);
-    std::vector<Tensor<1,dim>>  eta_grad(dofs_per_cell);
-
-    std::vector<double>         cell_old_phi_values(this->quad_formula.size());
-    std::vector<Tensor<1,dim>>  cell_old_phi_grad(this->quad_formula.size());
-    
-    std::vector<Tensor<1,dim>>  cell_old_vel_values(this->quad_formula.size());
-
-    std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-
-    const FEValuesExtractors::Scalar    phi(0);
-    const FEValuesExtractors::Scalar    eta(1);
-
-    const FEValuesExtractors::Vector    vel(0);
-    
-    auto cell           = this->dof_handler_ch.begin_active();
-    auto cell_stokes    = this->dof_handler_stokes.begin_active();
-    const auto endc     = this->dof_handler_ch.end();
-
-    for(; cell != endc; cell++, cell_stokes++)
-    {
-
-        fe_val_ch.reinit(cell);
-        fe_val_stokes.reinit(cell_stokes);
-
-        local_matrix    = 0;
-        local_rhs       = 0;
-
-        cell->get_dof_indices(local_dof_indices);
-
-        fe_val_ch[phi].get_function_values(
-            this->solution_old_ch,
-            cell_old_phi_values
-        ); 
-        fe_val_ch[phi].get_function_gradients(
-            this->solution_old_ch,
-            cell_old_phi_grad
-        );
-
-        fe_val_stokes[vel].get_function_values(
-            this->solution_stokes,
-            cell_old_vel_values
-        );
-
-
-        for(uint q = 0 ;  q < this->quad_formula.size(); q++)
-        {   
-
-            double          phi_old_x       = cell_old_phi_values[q];
-            Tensor<1,dim>   phi_old_x_grad  = cell_old_phi_grad[q];
-            Tensor<1,dim>   vel_old_x       = cell_old_vel_values[q];
-
-            for(uint k = 0; k < dofs_per_cell; k++)
-            {
-                phi_val[k]  = fe_val_ch[phi].value(k,q);
-                eta_val[k]  = fe_val_ch[eta].value(k,q);
-
-                phi_grad[k] = fe_val_ch[phi].gradient(k,q);
-                eta_grad[k] = fe_val_ch[eta].gradient(k,q);
-            }
-
-            for(uint i = 0; i < dofs_per_cell; i++)
-            {
-                
-                for(uint j = 0; j < dofs_per_cell; j++)
-                {
-                    // (0,0): M
-                    local_matrix(i,j)
-                        +=  phi_val[i] * phi_val[j]
-                        *   fe_val_ch.JxW(q);
-                    
-                    // (0,1): kA
-                    local_matrix(i,j)
-                        +=  this->timestep 
-                        *   phi_grad[i] * eta_grad[j]
-                        *   fe_val_ch.JxW(q);
-
-                    // (1,0): - (2 M + epsilon^2 A)
-                    local_matrix(i,j)
-                        -=  2.0 * eta_val[i] * phi_val[j]
-                            * fe_val_ch.JxW(q);
-
-                    local_matrix(i,j)
-                        -=  pow(this->eps,2)
-                            * eta_grad[i] * phi_grad[j]
-                            * fe_val_ch.JxW(q); 
- 
-                    // (1,1): M
-                    local_matrix(i,j)
-                        +=  eta_val[i] * eta_val[j] * fe_val_ch.JxW(q);
-                }
-                
-                // <\varphi_i, phi_old>
-                local_rhs(i)    +=  phi_val[i]
-                                *   phi_old_x
-                                *   fe_val_ch.JxW(q);
-
-                // 3 k <\nabla\varphi_i, \nabla\phi_old>
-                local_rhs(i)    +=  3.0 * this->timestep
-                                *   phi_grad[i]
-                                *   phi_old_x_grad 
-                                *   fe_val_ch.JxW(q);
-
-                // - k <\nabla\varphi_i, 3(\phi_old)^2 \nabla\phi_old>
-                local_rhs(i)    -=  this->timestep 
-                                *   (phi_grad[i]
-                                *   3.0 * pow(phi_old_x,2) * phi_old_x_grad)
-                                *   fe_val_ch.JxW(q);
-                
-                // Advection
-                local_rhs(i)    += this->timestep * (
-                                    phi_val[i] *  vel_old_x * phi_old_x_grad
-                                ) * fe_val_ch.JxW(q);
-
-            }
-        }
-
-        this->constraints_ch.distribute_local_to_global(
-            local_matrix,
-            local_rhs,
-            local_dof_indices,
-            this->system_matrix_ch,
-            this->rhs_ch
-        );
-    }
-
-    std::cout << "Assembly completed" << std::endl;
+    this->assembleCahnHilliardMatrix();
+    this->assembleCahnHilliardRHS();
     
     // Decomposition of RHS vector
     auto phi_rhs = this->rhs_ch.block(0);
@@ -1932,13 +2044,15 @@ void SCHSolver<dim>::run(
         this->solveStokes();
 
     }
+
+    this->assembleCahnHilliardMatrix();
    
-    for(uint i = 0; i < 10000; i++)
+    for(uint i = 0; i < 1000000; i++)
     {
         this->assembleStokesRHS();
         this->solveStokes();
 
-        this->assembleCahnHilliard();
+        this->assembleCahnHilliardRHS();
         this->solveCahnHilliard();
  
         if (i % 100 == 0){
@@ -1959,20 +2073,47 @@ void SCHSolver<dim>::run(
 } // stokesCahnHilliard
 
 
-int main(){ 
-    std::cout   << "Running" << std::endl << std::endl;
+int main(){
+    try{
+        std::cout   << "Running" << std::endl << std::endl;
 
-    std::unordered_map<std::string, double> params;
+        std::unordered_map<std::string, double> params;
 
-    params["eps"]       = 1e-2;
-    params["gamma"]     = 1;
+        params["eps"]       = 1e-2;
+        params["gamma"]     = 1;
 
-    double total_sim_time = 10;
+        double total_sim_time = 10;
 
-    stokesCahnHilliard::SCHSolver<2> stokesCahnHilliard(1, true);
-    stokesCahnHilliard.run(params, total_sim_time);
+        stokesCahnHilliard::SCHSolver<2> stokesCahnHilliard(1, true);
+        stokesCahnHilliard.run(params, total_sim_time);
 
-    std::cout << "Finished running." << std::endl;
+        std::cout << "Finished running." << std::endl;
+    }
+    catch (std::exception &exc)
+    {
+        std::cerr << std::endl
+                  << std::endl
+                  << "----------------------------------------------------"
+                  << std::endl;
+        std::cerr << "Exception on processing: " << std::endl
+                  << exc.what() << std::endl
+                  << "Aborting!" << std::endl
+                  << "----------------------------------------------------"
+                  << std::endl;
 
+        return 1;
+    }
+    catch (...)
+    {
+        std::cerr << std::endl
+                  << std::endl
+                  << "----------------------------------------------------"
+                  << std::endl;
+        std::cerr << "Unknown exception!" << std::endl
+                  << "Aborting!" << std::endl
+                  << "----------------------------------------------------"
+                  << std::endl;
+        return 1;
+    }
     return 0;
 }

@@ -4,6 +4,7 @@
 
 #include <deal.II/base/data_out_base.h>
 #include <deal.II/base/quadrature.h>
+#include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/subscriptor.h>
 #include <deal.II/base/symmetric_tensor.h>
 #include <deal.II/base/tensor.h>
@@ -96,22 +97,43 @@ double InitialValuesPhi<dim>::value(
 
         Point<dim> shifted_p1 = p;
         Point<dim> shifted_p2 = p;
+        Point<dim> shifted_p3 = p;
+        Point<dim> shifted_p4 = p;
 
-        shifted_p1[0] -= 0.25;
-        shifted_p1[1] -= 0.25;
+        shifted_p1[0] -= 0.5;
+        shifted_p1[1] -= 0.5;
 
-        shifted_p2[0] += 0.25;
-        shifted_p2[1] += 0.25;
+        shifted_p2[0] += 0.5;
+        shifted_p2[1] += 0.5;
+        
+        shifted_p3[0] -= 0.5;
+        shifted_p3[1] += 0.5;
+        
+        shifted_p4[0] += 0.5;
+        shifted_p4[1] -= 0.5;
 
-        double droplet_1 = std::tanh(
-            (shifted_p1.norm()-0.25) / (std::sqrt(2) * this->eps)
+        std::vector<double> droplets(4);
+
+        droplets[0] = std::tanh(
+            (shifted_p1.norm()-0.1) / (std::sqrt(2) * this->eps)
         );
 
-        double droplet_2 = std::tanh(
-                (shifted_p2.norm()-0.25) / (std::sqrt(2) * this->eps)
+        droplets[1] = std::tanh(
+            (shifted_p2.norm()-0.11) / (std::sqrt(2) * this->eps)
         );
 
-        return droplet_1 * droplet_2;
+        droplets[2] = std::tanh(
+            (shifted_p3.norm()-0.12) / (std::sqrt(2) * this->eps)
+        );
+
+        droplets[3] = std::tanh(
+            (shifted_p4.norm()-0.13) / (std::sqrt(2) * this->eps)
+        );
+
+        return std::accumulate(droplets.begin(),
+                               droplets.end(),
+                               1.0,
+                               std::multiplies<double>());
 
     } else {
         return 0;
@@ -657,6 +679,9 @@ class SCHSolver
         void solveStokes();
         void solveCahnHilliard();
 
+        double calculateMaxVelocity();
+        void   calculateTimestep();
+
         void outputSurfaceTension();
         void outputStokes(const uint timestep_number);
         void outputCahnHilliard(const uint timestep_number);
@@ -717,7 +742,7 @@ SCHSolver<dim>::SCHSolver(const uint degree, const bool debug,
 , quad_formula(degree+2)
 , dof_handler_stokes(triangulation)
 , dof_handler_ch(triangulation)
-, timestep(1e-4)
+, timestep(1e-2)
 , time(timestep)
 , timestep_number(1)
 , debug(debug)
@@ -1389,7 +1414,7 @@ void SCHSolver<dim>::solveStokes()
     auto B      = linear_operator(this->system_matrix_stokes.block(1,0));
     auto Mp     = linear_operator(this->system_matrix_precon.block(1,1));
 
-    std::cout << "Block norms: " << std::endl;
+    /*std::cout << "Block norms: " << std::endl;
     std::cout << "\t" << this->system_matrix_stokes.block(0,0).frobenius_norm()
               << std::endl;
     std::cout << "\t" << this->system_matrix_stokes.block(0,1).frobenius_norm()
@@ -1397,7 +1422,7 @@ void SCHSolver<dim>::solveStokes()
     std::cout << "\t" << this->system_matrix_stokes.block(1,0).frobenius_norm()
               << std::endl;
     std::cout << "\t" << this->system_matrix_precon.block(1,1).frobenius_norm()
-              << std::endl;
+              << std::endl;*/
 
     SolverControl                           solver_control_A(
                                                 2000, 
@@ -1730,72 +1755,38 @@ void SCHSolver<dim>::solveCahnHilliard()
 
     std::cout << "Solving Cahn-Hilliard system" << std::endl;
 
-    ReductionControl solverControlInner(2000, 1.0e-18, 1.0e-10);
-    SolverCG<Vector<double>>    solverInner(solverControlInner);
+    SolverControl                    solver_control(
+                                        2000,
+                                        1e-12 * this->rhs_ch.l2_norm()
+                                     );
+    SolverGMRES<BlockVector<double>> solver_ch(solver_control);
 
-    SolverControl               solverControlOuter(
-                                    10000,
-                                    1e-10 * this->rhs_ch.l2_norm()
-                                );
-    SolverGMRES<
-        Vector<double>
-        >    solverOuter(solverControlOuter);
+    SparseDirectUMFPACK precon_ch;
+    precon_ch.initialize(this->system_matrix_ch);
+
+    solver_ch.solve(this->system_matrix_ch, this->solution_ch,
+                    this->rhs_ch, precon_ch);
     
-    // Decomposition of tangent matrix
-    const auto A = linear_operator(this->system_matrix_ch.block(0,0));
-    const auto B = linear_operator(this->system_matrix_ch.block(0,1));
-    const auto C = linear_operator(this->system_matrix_ch.block(1,0));
-    const auto D = linear_operator(this->system_matrix_ch.block(1,1));
-   
-    // Decomposition of solution vector
-    auto phi = this->solution_ch.block(0);
-    auto eta = this->solution_ch.block(1);
-    
-    // Decomposition of RHS vector
-    auto phi_rhs = this->rhs_ch.block(0);
-    auto eta_rhs = this->rhs_ch.block(1);
-    
-    SparseDirectUMFPACK precon_A;
-    precon_A.initialize(this->system_matrix_ch.block(0,0));
-
-    // Construction of inverse of Schur complement
-    const auto A_inv = inverse_operator(A, solverInner, precon_A);
-    const auto S = schur_complement(A_inv,B,C,D);
-     
-    const auto S_inv = inverse_operator(S, solverOuter, 
-                                        this->system_matrix_ch.block(1,1));
-     
-    // Solve reduced block system
-    // PackagedOperation that represents the condensed form of g
-    auto rhs = condense_schur_rhs(A_inv,C, phi_rhs, eta_rhs);
-     
-    // Solve for y
-    eta = S_inv * rhs;
-
-    std::cout << "\tSolved for eta..." << std::endl;
-     
-    // Compute x using resolved solution y
-    phi = postprocess_schur_solution (A_inv, B, eta, phi_rhs);
-
-    std::cout << "\tSolved for phi..." << std::endl;
-
-    auto eta_range = std::minmax_element(eta.begin(),
-                                         eta.end());
-    auto phi_range = std::minmax_element(phi.begin(),
-                                         phi.end());
-
-    std::cout   <<    "   Phi range: (" 
-                << *phi_range.first << ", "
-                << *phi_range.second 
-                << ")" << std::endl;
-    std::cout   <<    "   Eta range: (" 
-                << *eta_range.first << ", "
-                << *eta_range.second 
-                << ")" << std::endl;
-
-    this->solution_ch.block(0) = phi;
-    this->solution_ch.block(1) = eta;
     this->constraints_ch.distribute(this->solution_ch);
+    
+    auto phi_range = std::minmax_element(
+        this->solution_ch.block(0).begin(),
+        this->solution_ch.block(0).end());
+    auto eta_range = std::minmax_element(
+        this->solution_ch.block(1).begin(),
+        this->solution_ch.block(1).end());
+
+    std::cout   << "Initial values propagated:\n"
+                << "    Phi Range: (" 
+                    << *phi_range.first << ", " 
+                    << *phi_range.second
+                << ")" 
+                << std::endl;
+    std::cout   << "    Eta Range: (" 
+                    << *eta_range.first << ", " 
+                    << *eta_range.second
+                << ")" 
+                << std::endl;
 
 }
 
@@ -2010,6 +2001,53 @@ void SCHSolver<dim>::outputTimestep(const uint timestep_number)
 }
 
 template<int dim>
+double SCHSolver<dim>::calculateMaxVelocity()
+{
+    const QIterated<dim> temp_quad_formula(QTrapezoid<1>(), this->degree+1);
+    const uint n_q_points = temp_quad_formula.size();
+
+    FEValues<dim> fe_values(
+        this->fe_stokes,
+        temp_quad_formula,
+        update_values
+    );
+
+    std::vector<Tensor<1,dim>> vel_values(n_q_points);
+    double                     max_vel = 0;
+
+    FEValuesExtractors::Vector velocities(0);
+
+    for(const auto &cell : this->dof_handler_stokes.active_cell_iterators())
+    {
+        fe_values.reinit(cell);
+        fe_values[velocities].get_function_values(this->solution_stokes,
+                                                  vel_values);
+        for(uint q = 0; q < n_q_points; q++)
+        {
+            max_vel = std::max(max_vel, vel_values[q].norm());
+        }
+    }
+
+    return max_vel;
+}
+
+template<int dim>
+void SCHSolver<dim>::calculateTimestep()
+{
+    double max_velocity = this->calculateMaxVelocity();
+
+    this->timestep = std::min(
+        1e-2,
+        (
+            1. / (1.7 * dim * std::sqrt(1. * dim)) / (1. * this->degree) 
+            * GridTools::minimal_cell_diameter(this->triangulation)
+        ) / max_velocity
+    );
+
+    std::cout << "Timestep update: " << this->timestep << std::endl;
+}
+
+template<int dim>
 void SCHSolver<dim>::run(
     std::unordered_map<std::string, double> params,
     double                                  total_sim_time)
@@ -2030,7 +2068,7 @@ void SCHSolver<dim>::run(
     
     this->solveStokes();
 
-    for(uint i = 0; i < 4; i++)
+    for(uint i = 0; i < 5; i++)
     {
 
         this->refineGrid();
@@ -2047,15 +2085,17 @@ void SCHSolver<dim>::run(
 
     this->assembleCahnHilliardMatrix();
    
-    for(uint i = 0; i < 1000000; i++)
+    for(uint i = 0; i < 10000; i++)
     {
         this->assembleStokesRHS();
         this->solveStokes();
 
+        this->calculateTimestep();
+
         this->assembleCahnHilliardRHS();
         this->solveCahnHilliard();
- 
-        if (i % 100 == 0){
+
+        if (i % 10 == 0){
             this->outputTimestep(this->timestep_number);
             
             std::cout   << "Completed timestep number: " 
@@ -2065,6 +2105,14 @@ void SCHSolver<dim>::run(
             timestep_number++;
         }
         
+        if(i % 5 == 0){
+            this->refineGrid();
+
+            this->assembleStokesPrecon();
+            this->assembleStokesMatrix();
+            this->assembleCahnHilliardMatrix();
+        }
+ 
         this->solution_old_ch = this->solution_ch;
     }
 

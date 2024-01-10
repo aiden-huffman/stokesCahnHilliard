@@ -11,8 +11,9 @@
 #include <deal.II/base/types.h>
 #include <deal.II/base/function.h>
 #include <deal.II/base/work_stream.h>
-
 #include <deal.II/base/utilities.h>
+#include <deal.II/base/thread_management.h>
+
 #include <deal.II/fe/fe.h>
 #include <deal.II/grid/grid_tools.h>
 #include <deal.II/grid/tria.h>
@@ -141,98 +142,6 @@ double InitialValuesPhi<dim>::value(
 }
 
 } // EquationData
-
-namespace LinearSolver
-{
-    template<int dim>
-    struct InnerPreconditioner
-    {
-        using type = SparseILU<double>;
-    };
-
-    template<class MatrixType, class PreconditionerType>
-    class InverseMatrix : public Subscriptor
-    {
-    public:
-        InverseMatrix(
-            const MatrixType            &m,
-            const PreconditionerType    &preconditioner
-        );
-
-        void vmult(Vector<double> &dst, const Vector<double> &src) const;
-
-    private:
-        const SmartPointer<const MatrixType>            matrix;
-        const SmartPointer<const PreconditionerType>    preconditioner;
-    };
-
-    template<class MatrixType, class PreconditionerType>
-    InverseMatrix<MatrixType, PreconditionerType>::InverseMatrix(
-    const MatrixType            &m,
-    const PreconditionerType    &preconditioner
-    )
-    : matrix(&m)
-    , preconditioner(&preconditioner)
-    {}
-
-    template<class MatrixType, class PreconditionerType>
-    void InverseMatrix<MatrixType, PreconditionerType>::vmult(
-        Vector<double>          &dst,
-        const Vector<double>    &src
-    ) const
-    {
-        SolverControl               solver_control(src.size(),
-                                                   1e-6 * src.l2_norm());
-        SolverCG<Vector<double>>    cg(solver_control);
-
-        dst = 0;
-
-        cg.solve(*matrix, dst, src, *preconditioner);
-    }
-
-    template <class PreconditionerType>
-    class SchurComplement : public Subscriptor
-    {
-    public:
-        SchurComplement(
-            const BlockSparseMatrix<double> &system_matrix,
-            const InverseMatrix<
-                SparseMatrix<double>,
-                PreconditionerType> &A_inverse
-        );
-
-        void vmult(Vector<double> &dst, const Vector<double> &src) const;
-
-    private:
-        const SmartPointer<const BlockSparseMatrix<double>> system_matrix;
-        const SmartPointer<
-        const InverseMatrix<SparseMatrix<double>, PreconditionerType>>
-        A_inverse;
-
-        mutable Vector<double> tmp1, tmp2;
-    };
-  
-    template <class PreconditionerType>
-    SchurComplement<PreconditionerType>::SchurComplement(
-        const BlockSparseMatrix<double> &system_matrix,
-        const InverseMatrix<SparseMatrix<double>, PreconditionerType> &A_inverse
-    ) : system_matrix(&system_matrix)
-    , A_inverse(&A_inverse)
-    , tmp1(system_matrix.block(0, 0).m())
-    , tmp2(system_matrix.block(0, 0).m())
-    {}
-
-    template <class PreconditionerType>
-    void
-    SchurComplement<PreconditionerType>::vmult(Vector<double> &      dst,
-                                               const Vector<double> &src) const
-    {
-        // B * A * B^T * src
-        system_matrix->block(0, 1).vmult(tmp1, src);
-        A_inverse->vmult(tmp2, tmp1);
-        system_matrix->block(1, 0).vmult(dst, tmp2);
-    }
-} // LinearSolver
 
 namespace Assembly
 {
@@ -422,9 +331,13 @@ namespace Assembly
         std::vector<Tensor<1,dim>>  phi_grad;
 
         std::vector<double>         phi_old_q;
-        std::vector<Tensor<1,dim>>  phi_grad_old_q;
+        std::vector<double>         phi_old_old_q;
 
-        std::vector<Tensor<1,dim>>   vel_old_q;
+        std::vector<Tensor<1,dim>>  phi_grad_old_q;
+        std::vector<Tensor<1,dim>>         phi_grad_old_old_q;
+
+        std::vector<Tensor<1,dim>>  vel_q;
+        std::vector<Tensor<1,dim>>  vel_old_q;
  
     };
 
@@ -444,7 +357,10 @@ namespace Assembly
     , phi_val(fe_ch.n_dofs_per_cell())
     , phi_grad(fe_ch.n_dofs_per_cell())
     , phi_old_q(quad_ch.size())
+    , phi_old_old_q(quad_ch.size())
     , phi_grad_old_q(quad_ch.size())
+    , phi_grad_old_old_q(quad_ch.size())
+    , vel_q(quad_ch.size())
     , vel_old_q(quad_ch.size())
     {}
 
@@ -462,7 +378,10 @@ namespace Assembly
     , phi_val(scratch.phi_val)
     , phi_grad(scratch.phi_grad)
     , phi_old_q(scratch.phi_old_q)
+    , phi_old_old_q(scratch.phi_old_q)
     , phi_grad_old_q(scratch.phi_grad_old_q)
+    , phi_grad_old_old_q(scratch.phi_grad_old_q)
+    , vel_q(scratch.vel_old_q)
     , vel_old_q(scratch.vel_old_q)
     {}
 
@@ -602,7 +521,7 @@ class SCHSolver
     {
     public:
         SCHSolver(const uint degree, const bool debug=false,
-                  const uint max_grid_level = 9,
+                  const uint max_grid_level = 11,
                   const uint min_grid_level = 3);
         void run(const std::unordered_map<std::string, double> params,
                  const double                                  total_sim_time);
@@ -675,6 +594,9 @@ class SCHSolver
 
         void assembleCahnHilliardMatrix();
         void assembleCahnHilliardRHS();
+
+        void assembleCahnHilliard(bool assembleMatrix = false);
+        void assembleStokes(bool assembleMatrix = false);
         
         void solveStokes();
         void solveCahnHilliard();
@@ -703,6 +625,7 @@ class SCHSolver
         BlockSparsityPattern        sparsity_pattern_stokes;
         BlockSparseMatrix<double>   system_matrix_stokes;
         BlockVector<double>         solution_stokes;
+        BlockVector<double>         solution_old_stokes;
         BlockVector<double>         rhs_stokes;
         BlockSparseMatrix<double>   system_matrix_precon;
 
@@ -710,12 +633,15 @@ class SCHSolver
         BlockSparseMatrix<double>    system_matrix_ch;
         BlockVector<double>          solution_ch;
         BlockVector<double>          solution_old_ch;
+        BlockVector<double>          solution_old_old_ch;
         BlockVector<double>          rhs_ch;
         
         double      timestep;
-        double      time;
+        double      timestep_old;
+
         uint        timestep_number;
         double      total_simulation_time;
+        double      current_simulation_time;
 
         double gamma;
         double rho_0;
@@ -743,8 +669,10 @@ SCHSolver<dim>::SCHSolver(const uint degree, const bool debug,
 , dof_handler_stokes(triangulation)
 , dof_handler_ch(triangulation)
 , timestep(1e-2)
-, time(timestep)
+, timestep_old(1e-2)
 , timestep_number(1)
+, total_simulation_time(10)
+, current_simulation_time(0)
 , debug(debug)
 , max_grid_level(max_grid_level)
 , min_grid_level(min_grid_level)
@@ -844,16 +772,14 @@ void SCHSolver<dim>::setupTriang()
 template<int dim>
 void SCHSolver<dim>::setupDoFs()
 {
-    std::cout << "Setting up DoFs for Stokes portion" << std::endl;
+    std::cout << "Setting up DoFs" << std::endl;
 
     {
     std::vector<uint> block_component(dim+1,0);
     block_component[dim] = 1;
 
-    std::cout << "\tDistributing..." << std::endl;
     this->dof_handler_stokes.distribute_dofs(this->fe_stokes);
 
-    std::cout << "\tRenumbering..." << std::endl;
     DoFRenumbering::Cuthill_McKee(this->dof_handler_stokes);
     DoFRenumbering::component_wise(
         this->dof_handler_stokes,
@@ -870,14 +796,13 @@ void SCHSolver<dim>::setupDoFs()
         {dofs_per_block[0],
          dofs_per_block[1]};
     
-    std::cout   << "\tNumber of degrees of freedom: "
+    std::cout   << "\tNumber of degrees of freedom for Stokes: "
                 << dof_handler_stokes.n_dofs()
                 << std::endl;
     std::cout   << "\tPer block:\n"
                 << "\t\tBlock 0: " << dofs_per_block[0] << std::endl
                 << "\t\tBlock 1: " << dofs_per_block[1] << std::endl;
 
-    std::cout << "\tUpdating constraints" << std::endl;
     this->constraints_stokes.clear();
     this->constraints_pressure.clear();
 
@@ -919,13 +844,9 @@ void SCHSolver<dim>::setupDoFs()
     this->constraints_stokes.merge(this->constraints_pressure,
                                    AffineConstraints<double>::no_conflicts_allowed);
 
-    std::cout << "\tClosing constraints" << std::endl;
     this->constraints_pressure.close();
     this->constraints_stokes.close();
     
-    std::cout   << "\tBuilding sparsity pattern..."
-                << std::endl;
-
     BlockDynamicSparsityPattern dsp(block_sizes, block_sizes);
     DoFTools::make_sparsity_pattern(
         this->dof_handler_stokes,
@@ -935,18 +856,14 @@ void SCHSolver<dim>::setupDoFs()
 
     sparsity_pattern_stokes.copy_from(dsp);
 
-    std::cout << "Completed Stokes portion" << std::endl;
     }
 
-    std::cout << "Setting up DoFs for Cahn-Hilliard potion" << std::endl;
     {
     std::vector<uint> block_component(2,0);
     block_component[1] = 1;
     
-    std::cout << "\tDistributing..." << std::endl;
     this->dof_handler_ch.distribute_dofs(this->fe_ch);
     
-    std::cout << "\tRenumbering..." << std::endl;
     DoFRenumbering::Cuthill_McKee(this->dof_handler_ch);
     DoFRenumbering::component_wise(
             this->dof_handler_ch,
@@ -960,14 +877,13 @@ void SCHSolver<dim>::setupDoFs()
         {dofs_per_component[0],
          dofs_per_component[1]};
 
-    std::cout   << "Number of degrees of freedom: "
+    std::cout   << "\tNumber of degrees of freedom for Cahn-Hilliard portion: "
                 << this->dof_handler_ch.n_dofs()
                 << std::endl;
-    std::cout   << "Per block:\n"
-                << "    Block 0: " << dofs_per_component[0] << std::endl
-                << "    Block 1: " << dofs_per_component[1] << std::endl;
+    std::cout   << "\tPer block:\n"
+                << "\t\tBlock 0: " << dofs_per_component[0] << std::endl
+                << "\t\tBlock 1: " << dofs_per_component[1] << std::endl;
 
-    std::cout   << "\tUpdating constraints" << std::endl;
     this->constraints_ch.clear();
 
     DoFTools::make_hanging_node_constraints(
@@ -993,11 +909,8 @@ void SCHSolver<dim>::setupDoFs()
     DoFTools::make_periodicity_constraints<dim,dim>(periodicity_vectorY,
                                                     this->constraints_ch);
     
-    std::cout << "\tClosing constraints" << std::endl;
     this->constraints_ch.close();
 
-    std::cout   << "\tBuilding sparsity pattern..."
-                << std::endl;
     BlockDynamicSparsityPattern dsp(block_sizes, block_sizes);
 
     DoFTools::make_sparsity_pattern(this->dof_handler_ch,
@@ -1007,7 +920,6 @@ void SCHSolver<dim>::setupDoFs()
 
     this->sparsity_pattern_ch.copy_from(dsp);
 
-    std::cout << "Completed Cahn-Hillaird portion" << std::endl;
     }
 
     std::cout   << "Total degrees of freedom: "
@@ -1020,7 +932,7 @@ template<int dim>
 void SCHSolver<dim>::setupLinearSystems()
 {
     
-    std::cout   << "Setting up matrix and vector objects for Stokes portion"
+    std::cout   << "Setting up matrix and vector objects"
                 << std::endl;
     { 
     std::vector<uint> block_component(dim+1, 0);
@@ -1036,13 +948,12 @@ void SCHSolver<dim>::setupLinearSystems()
 
     this->system_matrix_stokes.reinit(this->sparsity_pattern_stokes);
     this->system_matrix_precon.reinit(this->sparsity_pattern_stokes);
+
     this->solution_stokes.reinit(block_sizes);
+    this->solution_old_stokes.reinit(block_sizes);
     this->rhs_stokes.reinit(block_sizes);
     }
-    std::cout << "Completed." << std::endl;
-
-    std::cout   << "Setting up matrix and vector objects for Cahn-Hilliard "
-                << "portion" << std::endl;
+    
     {
 
     const std::vector<types::global_dof_index> dofs_per_component =
@@ -1055,9 +966,11 @@ void SCHSolver<dim>::setupLinearSystems()
     this->system_matrix_ch.reinit(this->sparsity_pattern_ch);
     this->solution_ch.reinit(block_sizes);
     this->solution_old_ch.reinit(block_sizes);
+    this->solution_old_old_ch.reinit(block_sizes);
     this->rhs_ch.reinit(block_sizes);
 
     }
+    
     std::cout << "Completed" << std::endl;
 
 }
@@ -1069,17 +982,18 @@ void SCHSolver<dim>::initializeValues()
     
     VectorTools::interpolate(this->dof_handler_ch,
                              EquationData::InitialValuesPhi<dim>(this->eps),
-                             this->solution_old_ch);
+                             this->solution_ch);
 
-    this->constraints_ch.distribute(this->solution_old_ch);
-    this->solution_ch = this->solution_old_ch;
+    this->constraints_ch.distribute(this->solution_ch);
+    this->solution_old_ch       = this->solution_ch;
+    this->solution_old_old_ch   = this->solution_ch;
 
     auto phi_range = std::minmax_element(
-        this->solution_old_ch.block(0).begin(),
-        this->solution_old_ch.block(0).end());
+        this->solution_ch.block(0).begin(),
+        this->solution_ch.block(0).end());
     auto eta_range = std::minmax_element(
-        this->solution_old_ch.block(1).begin(),
-        this->solution_old_ch.block(1).end());
+        this->solution_ch.block(1).begin(),
+        this->solution_ch.block(1).end());
 
 
     std::cout   << "Initial values propagated:\n"
@@ -1148,8 +1062,6 @@ template<int dim>
 void SCHSolver<dim>::assembleStokesPrecon()
 {
 
-    std::cout << "Assembling Stokes preconditioner..." << std::endl;
-
     this->system_matrix_precon = 0;
 
     auto worker = [this](
@@ -1178,8 +1090,6 @@ void SCHSolver<dim>::assembleStokesPrecon()
             this->fe_stokes
         )
     );
-
-    std::cout << "Compeleted" << std::endl;
 
 }
 
@@ -1250,7 +1160,6 @@ void SCHSolver<dim>::copyStokesMatrixLocalToGlobal(
 template<int dim>
 void SCHSolver<dim>::assembleStokesMatrix()
 {
-    std::cout << "Assembling Stokes matrix" << std::endl;
 
     this->system_matrix_stokes = 0;
 
@@ -1283,7 +1192,6 @@ void SCHSolver<dim>::assembleStokesMatrix()
         )
     );
 
-    std::cout << "Completed" << std::endl;
 }
 
 template<int dim>
@@ -1364,7 +1272,6 @@ void SCHSolver<dim>::copyStokesRHSLocalToGlobal(
 template<int dim>
 void SCHSolver<dim>::assembleStokesRHS()
 {
-    std::cout << "Assembling Stokes right hand side" << std::endl;
 
     this->rhs_stokes = 0;
 
@@ -1400,7 +1307,6 @@ void SCHSolver<dim>::assembleStokesRHS()
         )
     );
 
-    std::cout << "Completed" << std::endl;
 }
 
 template<int dim>
@@ -1445,8 +1351,6 @@ void SCHSolver<dim>::solveStokes()
     const auto op_Mp_inv    = inverse_operator(Mp, solver_Mp, preconditioner_Mp);
     const auto op_S         = B * op_A_inv * B_T;
 
-    std::cout << "\tComputing right hand side" << std::endl;
-
     Vector<double> schur_rhs = B * op_A_inv * this->rhs_stokes.block(0);
 
     SolverControl                   schur_solver_control(
@@ -1469,7 +1373,7 @@ void SCHSolver<dim>::solveStokes()
 
     this->constraints_stokes.distribute(this->solution_stokes);
 
-    std::cout << "Finished solving Stokes portion" << std::endl;
+    std::cout << "Completed." << std::endl;
 
 }
 
@@ -1482,6 +1386,8 @@ void SCHSolver<dim>::assembleCahnHilliardMatrixLocal(
 {
 
     data.local_matrix = 0;
+
+    double timestep_ratio = timestep / timestep_old;
 
     scratch.fe_val_ch.reinit(cell);
 
@@ -1511,7 +1417,8 @@ void SCHSolver<dim>::assembleCahnHilliardMatrixLocal(
             {
                 // (0,0): M
                 data.local_matrix(i,j)
-                    +=  scratch.phi_val[i] * scratch.phi_val[j]
+                    +=  (1 + 2 * timestep_ratio) / (1 + timestep_ratio)
+                    *   scratch.phi_val[i] * scratch.phi_val[j]
                     *   scratch.fe_val_ch.JxW(q);
                 
                 // (0,1): kA
@@ -1556,8 +1463,6 @@ template<int dim>
 void SCHSolver<dim>::assembleCahnHilliardMatrix()
 {
 
-    std::cout << "Assembling Cahn-Hilliard matrix" << std::endl;
-
     this->system_matrix_ch = 0;
 
     auto worker = [this](
@@ -1574,8 +1479,6 @@ void SCHSolver<dim>::assembleCahnHilliardMatrix()
         this->copyCahnHilliardMatrixLocalToGlobal(data);
     };
 
-    std::cout << "Beginning work stream" << std::endl;
-    
     WorkStream::run(
         dof_handler_ch.begin_active(),
         dof_handler_ch.end(),
@@ -1591,7 +1494,6 @@ void SCHSolver<dim>::assembleCahnHilliardMatrix()
         )
     );
 
-    std::cout << "Completed" << std::endl;
 }
 
 template<int dim>
@@ -1612,6 +1514,7 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
 
     cell->get_dof_indices(data.local_dof_indices);
 
+    double timestep_ratio = timestep / timestep_old;
 
     const uint dofs_per_cell = scratch.fe_val_ch.get_fe().n_dofs_per_cell();
     const uint n_q_points    = scratch.fe_val_ch.get_quadrature().size();
@@ -1622,10 +1525,20 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
     scratch.fe_val_ch[phi].get_function_values(
         this->solution_old_ch,
         scratch.phi_old_q
-    ); 
+    );
+    scratch.fe_val_ch[phi].get_function_values(
+        this->solution_old_old_ch,
+        scratch.phi_old_old_q
+    );
+
+
     scratch.fe_val_ch[phi].get_function_gradients(
         this->solution_old_ch,
         scratch.phi_grad_old_q
+    );
+    scratch.fe_val_ch[phi].get_function_gradients(
+        this->solution_old_old_ch,
+        scratch.phi_grad_old_old_q
     );
 
     scratch.fe_val_stokes[velocities].get_function_values(
@@ -1638,28 +1551,51 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
         for(uint i = 0; i < dofs_per_cell; i++)
         { 
             // <\varphi_i, phi_old>
-            data.local_rhs(i)    +=  scratch.fe_val_ch[phi].value(i,q)
-                            *   scratch.phi_old_q[q]
-                            *   scratch.fe_val_ch.JxW(q);
+            data.local_rhs(i) +=  (1 + timestep_ratio) 
+                              *  scratch.fe_val_ch[phi].value(i,q)
+                              *  scratch.phi_old_q[q] 
+                              *  scratch.fe_val_ch.JxW(q);
+
+            data.local_rhs(i) -= std::pow(timestep_ratio,2) / (1 + timestep_ratio)
+                              * scratch.fe_val_ch[phi].value(i,q)
+                              * scratch.phi_old_old_q[q]
+                              * scratch.fe_val_ch.JxW(q);
 
             // 3 k <\nabla\varphi_i, \nabla\phi_old>
-            data.local_rhs(i)    +=  3.0 * this->timestep
+            data.local_rhs(i)    +=  3.0 * this->timestep * (1 + timestep_ratio)
                             *   scratch.fe_val_ch[phi].gradient(i, q)
                             *   scratch.phi_grad_old_q[q]
                             *   scratch.fe_val_ch.JxW(q);
+            
+            data.local_rhs(i)    -=  3.0 * this->timestep * timestep_ratio
+                            *   scratch.fe_val_ch[phi].gradient(i, q)
+                            *   scratch.phi_grad_old_old_q[q]
+                            *   scratch.fe_val_ch.JxW(q);
 
             // - k <\nabla\varphi_i, 3(\phi_old)^2 \nabla\phi_old>
-            data.local_rhs(i)    -=  this->timestep * (
+            data.local_rhs(i)    -=  this->timestep * (1 + timestep_ratio) * (
                                     scratch.fe_val_ch[phi].gradient(i,q)
                                     * 3.0 * pow(scratch.phi_old_q[q],2) 
                                     * scratch.phi_grad_old_q[q]
                                  ) * scratch.fe_val_ch.JxW(q);
+
+            data.local_rhs(i)    +=  this->timestep * timestep_ratio * (
+                                    scratch.fe_val_ch[phi].gradient(i,q)
+                                    * 3.0 * pow(scratch.phi_old_old_q[q],2) 
+                                    * scratch.phi_grad_old_old_q[q]
+                                 ) * scratch.fe_val_ch.JxW(q);
             
             // Advection
-            data.local_rhs(i)    += this->timestep * (
+            data.local_rhs(i)    += this->timestep * (1 + timestep_ratio) * (
+                                    scratch.fe_val_ch[phi].value(i,q) 
+                                    * scratch.vel_q[q] 
+                                    * scratch.phi_grad_old_q[q]
+                                 ) * scratch.fe_val_ch.JxW(q);
+
+            data.local_rhs(i)    -= this->timestep * timestep_ratio * (
                                     scratch.fe_val_ch[phi].value(i,q) 
                                     * scratch.vel_old_q[q] 
-                                    * scratch.phi_grad_old_q[q]
+                                    * scratch.phi_grad_old_old_q[q]
                                  ) * scratch.fe_val_ch.JxW(q);
         }
     }
@@ -1681,8 +1617,6 @@ void SCHSolver<dim>::copyCahnHilliardRHSLocalToGlobal(
 template<int dim>
 void SCHSolver<dim>::assembleCahnHilliardRHS()
 {
-    std::cout << "Assembling Cahn-Hilliard right hand side" << std::endl;
-
     this->rhs_ch = 0;
 
     auto worker = [this](
@@ -1699,8 +1633,6 @@ void SCHSolver<dim>::assembleCahnHilliardRHS()
         this->copyCahnHilliardRHSLocalToGlobal(data);
     };
 
-    std::cout << "Beginning work stream" << std::endl;
-    
     WorkStream::run(
         dof_handler_ch.begin_active(),
         dof_handler_ch.end(),
@@ -1718,16 +1650,30 @@ void SCHSolver<dim>::assembleCahnHilliardRHS()
         )
     );
 
-    std::cout << "Completed" << std::endl;
 }
 
 template<int dim>
-void SCHSolver<dim>::assembleCahnHilliard()
+void SCHSolver<dim>::assembleStokes(bool assembleMatrix)
+{
+    std::cout << "Assembling Stokes system" << std::endl;
+
+    if(assembleMatrix)
+    {
+        this->assembleStokesPrecon();
+        this->assembleStokesMatrix();
+    }
+    this->assembleStokesRHS();
+
+    std::cout << "Completed." << std::endl;
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleCahnHilliard(bool assembleMatrix)
 {
 
     std::cout << "Assembling Cahn-Hilliard system" << std::endl;
     
-    this->assembleCahnHilliardMatrix();
+    if(assembleMatrix) this->assembleCahnHilliardMatrix();
     this->assembleCahnHilliardRHS();
     
     // Decomposition of RHS vector
@@ -1738,6 +1684,8 @@ void SCHSolver<dim>::assembleCahnHilliard()
                                          phi_rhs.end());
     auto eta_range = std::minmax_element(eta_rhs.begin(),
                                          eta_rhs.end());
+
+    std::cout << "Completed." << std::endl;
 
     std::cout   <<    "   Phi RHS range: (" 
                 << *phi_range.first << ", "
@@ -1788,6 +1736,7 @@ void SCHSolver<dim>::solveCahnHilliard()
                 << ")" 
                 << std::endl;
 
+
 }
 
 template<int dim>
@@ -1810,9 +1759,11 @@ void SCHSolver<dim>::refineGrid()
         KellyErrorEstimator<dim>::face_diameter_over_twice_max_degree
     );
     
-    GridRefinement::refine_and_coarsen_optimize(
+    GridRefinement::refine_and_coarsen_fixed_fraction(
         this->triangulation,
-        estimated_error_per_cell
+        estimated_error_per_cell,
+        0.9,
+        0.1
     );
     
     KellyErrorEstimator<dim>::estimate(
@@ -1825,9 +1776,11 @@ void SCHSolver<dim>::refineGrid()
         KellyErrorEstimator<dim>::face_diameter_over_twice_max_degree
     );
     
-    GridRefinement::refine_and_coarsen_optimize(
+    GridRefinement::refine_and_coarsen_fixed_fraction(
         this->triangulation,
-        estimated_error_per_cell
+        estimated_error_per_cell,
+        0.9,
+        0.1
     );
 
     std::cout << "\tEstimated errors" << std::endl;
@@ -1851,15 +1804,26 @@ void SCHSolver<dim>::refineGrid()
 
     SolutionTransfer<dim, BlockVector<double>> ch_trans(this->dof_handler_ch);
     SolutionTransfer<dim, BlockVector<double>> ch_trans_old(this->dof_handler_ch);
+    SolutionTransfer<dim, BlockVector<double>> ch_trans_old_old(this->dof_handler_ch);
+
+    SolutionTransfer<dim, BlockVector<double>> stokes_trans_old(this->dof_handler_stokes);
 
     BlockVector<double> pre_refine_sol_ch;
     BlockVector<double> pre_refine_sol_old_ch;
+    BlockVector<double> pre_refine_sol_old_old_ch;
     pre_refine_sol_ch       = this->solution_ch;
     pre_refine_sol_old_ch   = this->solution_old_ch;
+    pre_refine_sol_old_old_ch   = this->solution_old_old_ch;
+
+    BlockVector<double> pre_refine_sol_old_stokes;
+    pre_refine_sol_old_stokes = this->solution_old_stokes;
 
     triangulation.prepare_coarsening_and_refinement();
+
     ch_trans.prepare_for_coarsening_and_refinement(pre_refine_sol_ch);
     ch_trans_old.prepare_for_coarsening_and_refinement(pre_refine_sol_old_ch);
+    ch_trans_old_old.prepare_for_coarsening_and_refinement(pre_refine_sol_old_old_ch);
+    stokes_trans_old.prepare_for_coarsening_and_refinement(pre_refine_sol_old_stokes);
 
     triangulation.execute_coarsening_and_refinement();
 
@@ -1870,9 +1834,14 @@ void SCHSolver<dim>::refineGrid()
 
     ch_trans.interpolate(pre_refine_sol_ch, this->solution_ch);
     ch_trans_old.interpolate(pre_refine_sol_old_ch, this->solution_old_ch);
+    ch_trans_old_old.interpolate(pre_refine_sol_old_ch, this->solution_old_old_ch);
+
+    stokes_trans_old.interpolate(pre_refine_sol_old_stokes, this->solution_old_stokes);
 
     this->constraints_ch.distribute(this->solution_ch);
     this->constraints_ch.distribute(this->solution_old_ch);
+    this->constraints_ch.distribute(this->solution_old_old_ch);
+    this->constraints_stokes.distribute(this->solution_old_stokes);
 
     std::cout << "Completed." << std::endl;
     
@@ -1964,6 +1933,9 @@ void SCHSolver<dim>::outputTimestep(const uint timestep_number)
     std::vector<std::string> stokes_names(dim, "velocity");
     stokes_names.emplace_back("pressure");
 
+    std::vector<std::string> stokes_old_names(dim, "velocity_old");
+    stokes_old_names.emplace_back("pressure_old");
+
     std::vector<
         DataComponentInterpretation::DataComponentInterpretation
     > stokes_component_interpretation(
@@ -1980,15 +1952,42 @@ void SCHSolver<dim>::outputTimestep(const uint timestep_number)
         2, DataComponentInterpretation::component_is_scalar
     );
 
+    std::vector<std::string> ch_old_names = {"phi_old", "eta_old"};
+    std::vector<
+        DataComponentInterpretation::DataComponentInterpretation
+    > ch_old_component_interpretation(
+        2, DataComponentInterpretation::component_is_scalar
+    );
+    std::vector<std::string> ch_old_old_names = {"phi_old_old", "eta_old_old"};
+
+    std::vector<
+        DataComponentInterpretation::DataComponentInterpretation
+    > ch_old_old_component_interpretation(
+        2, DataComponentInterpretation::component_is_scalar
+    );
+
     DataOut<dim> data_out;
     data_out.add_data_vector(this->dof_handler_stokes,
                              this->solution_stokes,
                              stokes_names,
                              stokes_component_interpretation);
+    data_out.add_data_vector(this->dof_handler_stokes,
+                             this->solution_old_stokes,
+                             stokes_old_names,
+                             stokes_component_interpretation);
+
     data_out.add_data_vector(this->dof_handler_ch,
                              this->solution_ch,
                              ch_names,
                              ch_component_interpretation);
+    data_out.add_data_vector(this->dof_handler_ch,
+                             this->solution_old_ch,
+                             ch_old_names,
+                             ch_old_component_interpretation);
+    data_out.add_data_vector(this->dof_handler_ch,
+                             this->solution_old_old_ch,
+                             ch_old_old_names,
+                             ch_old_old_component_interpretation);
 
     data_out.build_patches(
         std::min(this->fe_stokes.degree, this->fe_ch.degree)
@@ -2052,6 +2051,7 @@ void SCHSolver<dim>::run(
     std::unordered_map<std::string, double> params,
     double                                  total_sim_time)
 {
+    bool assembleMatrix = true;
     this->total_simulation_time = total_sim_time;
 
     this->setupParameters(params);
@@ -2060,22 +2060,18 @@ void SCHSolver<dim>::run(
     this->setupLinearSystems();
     
     this->initializeValues();
-    this->assembleStokesPrecon();
-    this->assembleStokesMatrix();
-    this->assembleStokesRHS();
+    this->assembleStokes(assembleMatrix);
     
     if(debug) this->outputSurfaceTension();
     
     this->solveStokes();
 
-    for(uint i = 0; i < 5; i++)
+    for(uint i = 0; i < 7; i++)
     {
 
         this->refineGrid();
         this->initializeValues();
-        this->assembleStokesPrecon();
-        this->assembleStokesMatrix();
-        this->assembleStokesRHS();
+        this->assembleStokes(assembleMatrix);
         
         if(debug) this->outputSurfaceTension();
         
@@ -2083,37 +2079,47 @@ void SCHSolver<dim>::run(
 
     }
 
-    this->assembleCahnHilliardMatrix();
-   
-    for(uint i = 0; i < 10000; i++)
+    this->assembleCahnHilliard(assembleMatrix);
+    this->solution_old_stokes = this->solution_stokes;
+    assembleMatrix = false;
+
+    uint i = 0;
+
+    for(this->current_simulation_time = 0;
+        this->current_simulation_time < this->total_simulation_time;
+        this->current_simulation_time += this->timestep, i++)
     {
-        this->assembleStokesRHS();
+        this->assembleStokes(assembleMatrix);
         this->solveStokes();
 
+        this->timestep_old = this->timestep;
         this->calculateTimestep();
 
-        this->assembleCahnHilliardRHS();
+        this->assembleCahnHilliard(assembleMatrix);
         this->solveCahnHilliard();
 
-        if (i % 10 == 0){
+        if(i % 10 == 0)
+        {
             this->outputTimestep(this->timestep_number);
-            
-            std::cout   << "Completed timestep number: " 
-                        << timestep_number
-                        << std::endl;
-
-            timestep_number++;
+            this->timestep_number++;
         }
-        
-        if(i % 5 == 0){
-            this->refineGrid();
 
-            this->assembleStokesPrecon();
-            this->assembleStokesMatrix();
-            this->assembleCahnHilliardMatrix();
-        }
- 
+        this->solution_old_old_ch = this->solution_old_ch;
         this->solution_old_ch = this->solution_ch;
+        this->solution_old_stokes = this->solution_stokes;
+        this->total_simulation_time += this->timestep;
+
+        if(i % 3 == 0){
+            this->refineGrid();
+            assembleMatrix = true;
+        } else {
+            assembleMatrix = false;     
+        }
+
+        std::cout   << "Current time: "
+                    << this->current_simulation_time
+                    << std::endl;
+ 
     }
 
 }
@@ -2127,7 +2133,7 @@ int main(){
 
         std::unordered_map<std::string, double> params;
 
-        params["eps"]       = 1e-2;
+        params["eps"]       = 1e-3;
         params["gamma"]     = 1;
 
         double total_sim_time = 10;

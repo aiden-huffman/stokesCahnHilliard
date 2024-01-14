@@ -81,6 +81,87 @@
 
 namespace stokesCahnHilliard {
     using namespace dealii;
+
+namespace LinearSolvers
+{
+template <class Matrix, class Preconditioner>
+class InverseMatrix : public Subscriptor
+{
+public:
+InverseMatrix(const Matrix &m, const Preconditioner &preconditioner);
+
+template <typename VectorType>
+void vmult(VectorType &dst, const VectorType &src) const;
+
+private:
+const SmartPointer<const Matrix> matrix;
+const Preconditioner &           preconditioner;
+};
+
+template <class Matrix, class Preconditioner>
+InverseMatrix<Matrix, Preconditioner>::InverseMatrix(
+const Matrix &        m,
+const Preconditioner &preconditioner)
+: matrix(&m)
+, preconditioner(preconditioner)
+{}
+
+template <class Matrix, class Preconditioner>
+template <typename VectorType>
+void
+InverseMatrix<Matrix, Preconditioner>::vmult(VectorType &      dst,
+                                           const VectorType &src) const
+{
+    SolverControl        solver_control(src.size(),
+                                        std::max(1e-8,
+                                        1e-8 * src.l2_norm()));
+    SolverGMRES<VectorType> cg(solver_control);
+    dst = 0;
+
+    try
+      {
+        cg.solve(*matrix, dst, src, preconditioner);
+      }
+    catch (std::exception &e)
+      {
+        Assert(false, ExcMessage(e.what()));
+      }
+}
+
+template <class PreconditionerA, class PreconditionerS>
+class BlockDiagonalPreconditioner : public Subscriptor
+{
+public:
+    BlockDiagonalPreconditioner(const PreconditionerA &preconditioner_A,
+                                const PreconditionerS &preconditioner_S);
+
+    void vmult(TrilinosWrappers::MPI::BlockVector &      dst,
+               const TrilinosWrappers::MPI::BlockVector &src) const;
+
+private:
+    const PreconditionerA &preconditioner_A;
+    const PreconditionerS &preconditioner_S;
+};
+
+template <class PreconditionerA, class PreconditionerS>
+BlockDiagonalPreconditioner<PreconditionerA, PreconditionerS>::
+BlockDiagonalPreconditioner(const PreconditionerA &preconditioner_A,
+                            const PreconditionerS &preconditioner_S)
+: preconditioner_A(preconditioner_A)
+, preconditioner_S(preconditioner_S)
+{}
+
+template <class PreconditionerA, class PreconditionerS>
+void BlockDiagonalPreconditioner<PreconditionerA, PreconditionerS>::vmult(
+TrilinosWrappers::MPI::BlockVector &      dst,
+const TrilinosWrappers::MPI::BlockVector &src) const
+{
+    preconditioner_A.vmult(dst.block(0), src.block(0));
+    preconditioner_S.vmult(dst.block(1), src.block(1));
+}
+
+}// LinearSolvers
+
 namespace EquationData
 {
 
@@ -537,7 +618,7 @@ class SCHSolver
 {
 public:
     SCHSolver();
-    void run();
+    void run(bool debug=false);
 
 private:
 
@@ -545,6 +626,8 @@ private:
     ConditionalOStream  pcout;
 
     double eps;
+
+    uint min_refine, max_refine;
 
     uint                                        degree;
     parallel::distributed::Triangulation<dim>   triangulation;
@@ -556,7 +639,6 @@ private:
     DoFHandler<dim> dof_handler_ch;
 
     AffineConstraints<double>   constraints_stokes;
-    AffineConstraints<double>   constraints_pressure;
     AffineConstraints<double>   constraints_ch;
 
     TrilinosWrappers::BlockSparseMatrix matrix_stokes;
@@ -572,6 +654,9 @@ private:
     TrilinosWrappers::MPI::BlockVector  solution_old_ch;
     TrilinosWrappers::MPI::BlockVector  solution_old_old_ch;
     TrilinosWrappers::MPI::BlockVector  rhs_ch;
+
+    double timestep, timestep_old;
+    uint timestep_number;
 
     void setupTriang();
 
@@ -592,6 +677,7 @@ private:
 
     void initializeValues();
 
+    // Stokes Assembly
     void assembleStokesPreconLocal(
         const typename DoFHandler<dim>::active_cell_iterator &cell,
         Assembly::Scratch::StokesPreconditioner<dim>         &scratch,
@@ -621,24 +707,62 @@ private:
         const Assembly::CopyData::StokesRHS<dim> &data
     );
     void assembleStokesRHS();
+    
+    // Cahn-Hilliard Assembly
+    void assembleCahnHilliardMatrixLocal(
+        const typename DoFHandler<dim>::active_cell_iterator &cell,
+        Assembly::Scratch::CahnHilliardMatrix<dim>&        scratch,
+        Assembly::CopyData::CahnHilliardMatrix<dim>&       data
+    );
+    void copyCahnHilliardMatrixLocalToGlobal(
+        const Assembly::CopyData::CahnHilliardMatrix<dim> &data
+    );
+    void assembleCahnHilliardMatrix();
+
+    void assembleCahnHilliardRHSLocal(
+        const typename DoFHandler<dim>::active_cell_iterator &cell,
+        Assembly::Scratch::CahnHilliardRHS<dim>&        scratch,
+        Assembly::CopyData::CahnHilliardRHS<dim>&       data
+    );
+    void copyCahnHilliardRHSLocalToGlobal(
+        const Assembly::CopyData::CahnHilliardRHS<dim> &data
+    );
+    void assembleCahnHilliardRHS();
+
+    // Solvers
+    void solveStokes();
+    void computeTimestep();
+    void solveCahnHilliard();
+
+    // Grid Refinement
+    void refineGrid();
+
+    // Output functions
+    void outputStokes();
+    void outputTimestep(const uint timestep_number);
 };
 
 template<int dim>
 SCHSolver<dim>::SCHSolver()
 : mpi_communicator(MPI_COMM_WORLD)
-, pcout(std::cout, (Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0))
+, pcout(std::cout, (Utilities::MPI::this_mpi_process(mpi_communicator) == 0))
 , eps(1e-3)
+, min_refine(4)
+, max_refine(11)
 , degree(1)
 , triangulation(mpi_communicator,
                 typename Triangulation<dim>::MeshSmoothing(
                 Triangulation<dim>::smoothing_on_refinement |
                 Triangulation<dim>::smoothing_on_coarsening)
                 )
-, fe_stokes(FE_Q<dim>(degree+1), dim, FE_DGP<dim>(degree), 1)
+, fe_stokes(FE_Q<dim>(degree+1), dim, FE_Q<dim>(degree), 1)
 , fe_ch(FE_Q<dim>(degree), 2)
 , quad_formula(degree+2)
 , dof_handler_stokes(this->triangulation)
 , dof_handler_ch(this->triangulation)
+, timestep(1e-2)
+, timestep_old(timestep)
+, timestep_number(0)
 {}
 
 template<int dim>
@@ -699,7 +823,7 @@ void SCHSolver<dim>::setupTriang()
     this->pcout << "\tNeighbours updated to reflect periodicity" << std::endl;
 
     this->pcout << "\tRefining grid" << std::endl;
-    triangulation.refine_global(8);
+    triangulation.refine_global(6);
 
     this->pcout << "\tActive cells: "
                 << triangulation.n_global_active_cells()
@@ -748,22 +872,6 @@ void SCHSolver<dim>::setupDoFsStokes()
 
         DoFTools::make_hanging_node_constraints(this->dof_handler_stokes,
                                                 this->constraints_stokes);
-
-        if(Utilities::MPI::this_mpi_process(mpi_communicator) == 0)
-        {
-            FEValuesExtractors::Scalar pressure(dim);
-            ComponentMask pressure_mask = 
-                this->fe_stokes.component_mask(pressure);
-
-            std::vector<IndexSet> pressure_dofs =
-                DoFTools::locally_owned_dofs_per_component(
-                    this->dof_handler_stokes,
-                    pressure_mask
-                );
-            const types::global_dof_index first_pressure_dof
-                = pressure_dofs[dim].nth_index_in_set(0);
-            this->constraints_stokes.add_line(first_pressure_dof);
-        }
 
         // Periodicity constraints
         if(dim == 2){
@@ -825,17 +933,12 @@ void SCHSolver<dim>::setupDoFsStokes()
     );
 
     this->solution_stokes.reinit(
-        stokes_partitioning,
         stokes_relevant_partitioning,
-        mpi_communicator,
-        true
+        mpi_communicator
     );
 
     this->solution_old_stokes.reinit(
-        stokes_partitioning,
-        stokes_relevant_partitioning,
-        mpi_communicator,
-        true
+        this->solution_stokes
     );
 
     this->rhs_stokes.reinit(
@@ -918,6 +1021,10 @@ void SCHSolver<dim>::setupDoFsCahnHilliard()
     const types::global_dof_index n_phi = dofs_per_block[0],
                                   n_eta = dofs_per_block[1];
 
+    this->pcout << "Number of CH DoFS:" << std::endl
+                << "\tBlock 0:" << n_phi << std::endl
+                << "\tBlock 1:" << n_eta << std::endl;
+
     std::vector<IndexSet> ch_partitioning, ch_relevant_partitioning;
     IndexSet ch_relevant_set;
     {
@@ -999,22 +1106,14 @@ void SCHSolver<dim>::setupDoFsCahnHilliard()
                              ch_relevant_partitioning);
 
     this->solution_ch.reinit(
-        ch_partitioning,
         ch_relevant_partitioning,
-        mpi_communicator,
-        true
+        mpi_communicator
     );
     this->solution_old_ch.reinit(
-        ch_partitioning,
-        ch_relevant_partitioning,
-        mpi_communicator,
-        true
+        this->solution_ch
     );
     this->solution_old_old_ch.reinit(
-        ch_partitioning,
-        ch_relevant_partitioning,
-        mpi_communicator,
-        true
+        this->solution_ch
     );
     this->rhs_ch.reinit(
         ch_partitioning,
@@ -1061,6 +1160,11 @@ void SCHSolver<dim>::setupDoFs()
     this->setupDoFsStokes();
     this->setupDoFsCahnHilliard();
 
+    this->pcout << "Total DoFs: "
+                << this->dof_handler_stokes.n_dofs()
+                +  this->dof_handler_ch.n_dofs()
+                << std::endl;
+
     this->pcout << "Completed." << std::endl;
 }
 
@@ -1068,12 +1172,40 @@ template<int dim>
 void SCHSolver<dim>::initializeValues()
 {
     this->pcout << "Initializing values for phi" << std::endl;
+
+    std::vector<uint> ch_sub_blocks(2,0);
+    ch_sub_blocks[1] = 1;
+
+    const std::vector<types::global_dof_index> dofs_per_block =
+        DoFTools::count_dofs_per_fe_block(this->dof_handler_ch,
+                                          ch_sub_blocks);
+
+    const types::global_dof_index n_phi = dofs_per_block[0],
+                                  n_eta = dofs_per_block[1];
+
+    std::vector<IndexSet> ch_partitioning;
+    IndexSet ch_relevant_set;
+    {
+        IndexSet ch_index_set = dof_handler_ch.locally_owned_dofs();
+        ch_partitioning.push_back(ch_index_set.get_view(0, n_phi));
+        ch_partitioning.push_back(ch_index_set.get_view(
+            n_phi, n_phi+n_eta
+        ));
+    }
+
+    TrilinosWrappers::MPI::BlockVector interp_tmp;
+    interp_tmp.reinit(
+        ch_partitioning,
+        mpi_communicator
+    );
     
     VectorTools::interpolate(this->dof_handler_ch,
                              EquationData::InitialValuesPhi<dim>(this->eps),
-                             this->solution_ch);
+                             interp_tmp);
 
-    this->constraints_ch.distribute(this->solution_ch);
+    this->constraints_ch.distribute(interp_tmp);
+
+    this->solution_ch = interp_tmp;
     this->solution_old_ch       = this->solution_ch;
     this->solution_old_old_ch   = this->solution_ch;
 
@@ -1187,6 +1319,10 @@ void SCHSolver<dim>::assembleStokesPrecon()
     );
 
     this->precon_stokes.compress(VectorOperation::add);
+
+    this->pcout << "Precon norm: "
+                << this->precon_stokes.block(1,1).frobenius_norm()
+                << std::endl;
                                                      
 }
 
@@ -1298,6 +1434,13 @@ void SCHSolver<dim>::assembleStokesMatrix()
 
     this->matrix_stokes.compress(VectorOperation::add);
 
+    this->pcout << "Block Norms:\n"
+                << "\tBlock (0,0): " << this->matrix_stokes.block(0,0).frobenius_norm()
+                << "\n\tBlock (0,1): " << this->matrix_stokes.block(0,1).frobenius_norm()
+                << "\n\tBlock (1,0): " << this->matrix_stokes.block(1,0).frobenius_norm()
+                << "\n\tBlock (1,1): " << this->matrix_stokes.block(1,1).frobenius_norm()
+                << std::endl;
+
 }
 
 template<int dim>
@@ -1315,9 +1458,10 @@ void SCHSolver<dim>::assembleStokesRHSLocal(
         cell->index(), &this->dof_handler_ch
     );
 
-    Assert(cell_ch->is_locally_owned(), ExcGhostsPresent());
-
     scratch.fe_val_ch.reinit(cell_ch);
+
+    Assert(cell->is_locally_owned() && cell_ch->is_locally_owned(),
+           ExcGhostsPresent());
 
     cell->get_dof_indices(data.local_dof_indices);
 
@@ -1424,21 +1568,724 @@ void SCHSolver<dim>::assembleStokesRHS()
     );
 
     this->rhs_stokes.compress(VectorOperation::add);
+    this->pcout << "Completed" << std::endl;
 
 }
 
 template<int dim>
-void SCHSolver<dim>::run()
+void SCHSolver<dim>::assembleCahnHilliardMatrixLocal(
+    const typename DoFHandler<dim>::active_cell_iterator &cell,
+    Assembly::Scratch::CahnHilliardMatrix<dim>           &scratch,
+    Assembly::CopyData::CahnHilliardMatrix<dim>          &data
+)
+{
+
+    data.local_matrix = 0;
+
+    double timestep_ratio = timestep / timestep_old;
+
+    scratch.fe_val_ch.reinit(cell);
+
+    cell->get_dof_indices(data.local_dof_indices);
+
+    uint dofs_per_cell  = scratch.fe_val_ch.get_fe().n_dofs_per_cell();
+    uint n_q_points     = scratch.fe_val_ch.get_quadrature().size();
+
+    FEValuesExtractors::Scalar  phi(0);
+    FEValuesExtractors::Scalar  eta(1);
+
+    for(uint q = 0; q < n_q_points; q++)
+    {
+
+        for(uint k = 0; k < dofs_per_cell; k++)
+        {
+            scratch.phi_val[k]  = scratch.fe_val_ch[phi].value(k,q);
+            scratch.eta_val[k]  = scratch.fe_val_ch[eta].value(k,q);
+
+            scratch.phi_grad[k] = scratch.fe_val_ch[phi].gradient(k,q);
+            scratch.eta_grad[k] = scratch.fe_val_ch[eta].gradient(k,q);
+        }
+
+        for(uint i = 0; i < dofs_per_cell; i++)
+        {
+            for(uint j = 0; j < dofs_per_cell; j++)
+            {
+                // (0,0): M
+                data.local_matrix(i,j)
+                    +=  (1 + 2 * timestep_ratio) / (1 + timestep_ratio)
+                    *   scratch.phi_val[i] * scratch.phi_val[j]
+                    *   scratch.fe_val_ch.JxW(q);
+                
+                // (0,1): kA
+                data.local_matrix(i,j)
+                    +=  this->timestep 
+                    *   scratch.phi_grad[i] * scratch.eta_grad[j]
+                    *   scratch.fe_val_ch.JxW(q);
+
+                // (1,0): - (2 M + epsilon^2 A)
+                data.local_matrix(i,j)
+                    -=  2.0 * scratch.eta_val[i] * scratch.phi_val[j]
+                        * scratch.fe_val_ch.JxW(q);
+
+                data.local_matrix(i,j)
+                    -=  pow(this->eps,2)
+                        * scratch.eta_grad[i] * scratch.phi_grad[j]
+                        * scratch.fe_val_ch.JxW(q); 
+
+                // (1,1): M
+                data.local_matrix(i,j)
+                    +=  scratch.eta_val[i] * scratch.eta_val[j] 
+                    * scratch.fe_val_ch.JxW(q);
+            }
+        }
+    }
+
+}
+
+template<int dim>
+void SCHSolver<dim>::copyCahnHilliardMatrixLocalToGlobal(
+    const Assembly::CopyData::CahnHilliardMatrix<dim> &data
+)
+{
+    this->constraints_ch.distribute_local_to_global(
+        data.local_matrix,
+        data.local_dof_indices,
+        this->matrix_ch
+    );
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleCahnHilliardMatrix()
+{
+
+    this->pcout << "Assembling Cahn-Hilliard matrix" << std::endl;
+
+    this->matrix_ch = 0;
+
+    auto worker = [this](
+        const typename DoFHandler<dim>::active_cell_iterator    &cell,
+        Assembly::Scratch::CahnHilliardMatrix<dim>              &scratch,
+        Assembly::CopyData::CahnHilliardMatrix<dim>             &data)
+    {
+        this->assembleCahnHilliardMatrixLocal(cell, scratch, data);
+    };
+
+    auto copier = [this](
+        const Assembly::CopyData::CahnHilliardMatrix<dim> &data
+    ) {
+        this->copyCahnHilliardMatrixLocalToGlobal(data);
+    };
+
+    using CellFilter = FilteredIterator<typename 
+        DoFHandler<dim>::active_cell_iterator>;
+
+    WorkStream::run(
+        CellFilter(IteratorFilters::LocallyOwnedCell(),
+                   dof_handler_ch.begin_active()),
+        CellFilter(IteratorFilters::LocallyOwnedCell(),
+                   dof_handler_ch.end()),
+        worker,
+        copier,
+        Assembly::Scratch::CahnHilliardMatrix<dim>(
+            this->fe_ch,
+            this->quad_formula,
+            update_values | update_JxW_values |
+            update_gradients),
+        Assembly::CopyData::CahnHilliardMatrix<dim>(
+            this->fe_ch
+        )
+    );
+
+    this->matrix_ch.compress(VectorOperation::add);
+    this->pcout << "Completed" << std::endl;
+
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
+    const typename DoFHandler<dim>::active_cell_iterator &cell,
+    Assembly::Scratch::CahnHilliardRHS<dim>              &scratch,
+    Assembly::CopyData::CahnHilliardRHS<dim>             &data
+)
+{
+    data.local_rhs = 0;
+    scratch.fe_val_ch.reinit(cell);
+
+    typename DoFHandler<dim>::active_cell_iterator cell_stokes(
+        &this->triangulation, cell->level(),
+        cell->index(), &this->dof_handler_stokes
+    );
+    scratch.fe_val_stokes.reinit(cell_stokes);
+
+    cell->get_dof_indices(data.local_dof_indices);
+
+    double timestep_ratio = timestep / timestep_old;
+
+    const uint dofs_per_cell = scratch.fe_val_ch.get_fe().n_dofs_per_cell();
+    const uint n_q_points    = scratch.fe_val_ch.get_quadrature().size();
+
+    FEValuesExtractors::Vector  velocities(0);
+    FEValuesExtractors::Scalar  phi(0);
+
+    scratch.fe_val_ch[phi].get_function_values(
+        this->solution_old_ch,
+        scratch.phi_old_q
+    );
+    scratch.fe_val_ch[phi].get_function_values(
+        this->solution_old_old_ch,
+        scratch.phi_old_old_q
+    );
+
+
+    scratch.fe_val_ch[phi].get_function_gradients(
+        this->solution_old_ch,
+        scratch.phi_grad_old_q
+    );
+    scratch.fe_val_ch[phi].get_function_gradients(
+        this->solution_old_old_ch,
+        scratch.phi_grad_old_old_q
+    );
+
+    scratch.fe_val_stokes[velocities].get_function_values(
+        this->solution_stokes,
+        scratch.vel_old_q
+    );
+
+    for(uint q = 0; q < n_q_points; q++)
+    {
+        for(uint i = 0; i < dofs_per_cell; i++)
+        { 
+            // <\varphi_i, phi_old>
+            data.local_rhs(i) +=  (1 + timestep_ratio) 
+                              *  scratch.fe_val_ch[phi].value(i,q)
+                              *  scratch.phi_old_q[q] 
+                              *  scratch.fe_val_ch.JxW(q);
+
+            data.local_rhs(i) -= std::pow(timestep_ratio,2) / (1 + timestep_ratio)
+                              * scratch.fe_val_ch[phi].value(i,q)
+                              * scratch.phi_old_old_q[q]
+                              * scratch.fe_val_ch.JxW(q);
+
+            // 3 k <\nabla\varphi_i, \nabla\phi_old>
+            data.local_rhs(i)    +=  3.0 * this->timestep * (1 + timestep_ratio)
+                            *   scratch.fe_val_ch[phi].gradient(i, q)
+                            *   scratch.phi_grad_old_q[q]
+                            *   scratch.fe_val_ch.JxW(q);
+            
+            data.local_rhs(i)    -=  3.0 * this->timestep * timestep_ratio
+                            *   scratch.fe_val_ch[phi].gradient(i, q)
+                            *   scratch.phi_grad_old_old_q[q]
+                            *   scratch.fe_val_ch.JxW(q);
+
+            // - k <\nabla\varphi_i, 3(\phi_old)^2 \nabla\phi_old>
+            data.local_rhs(i)    -=  this->timestep * (1 + timestep_ratio) * (
+                                    scratch.fe_val_ch[phi].gradient(i,q)
+                                    * 3.0 * pow(scratch.phi_old_q[q],2) 
+                                    * scratch.phi_grad_old_q[q]
+                                 ) * scratch.fe_val_ch.JxW(q);
+
+            data.local_rhs(i)    +=  this->timestep * timestep_ratio * (
+                                    scratch.fe_val_ch[phi].gradient(i,q)
+                                    * 3.0 * pow(scratch.phi_old_old_q[q],2) 
+                                    * scratch.phi_grad_old_old_q[q]
+                                 ) * scratch.fe_val_ch.JxW(q);
+            
+            // Advection
+            data.local_rhs(i)    += this->timestep * (1 + timestep_ratio) * (
+                                    scratch.fe_val_ch[phi].value(i,q) 
+                                    * scratch.vel_q[q] 
+                                    * scratch.phi_grad_old_q[q]
+                                 ) * scratch.fe_val_ch.JxW(q);
+
+            data.local_rhs(i)    -= this->timestep * timestep_ratio * (
+                                    scratch.fe_val_ch[phi].value(i,q) 
+                                    * scratch.vel_old_q[q] 
+                                    * scratch.phi_grad_old_old_q[q]
+                                 ) * scratch.fe_val_ch.JxW(q);
+        }
+    }
+
+}
+
+template<int dim>
+void SCHSolver<dim>::copyCahnHilliardRHSLocalToGlobal(
+    const Assembly::CopyData::CahnHilliardRHS<dim> &data
+)
+{
+    this->constraints_ch.distribute_local_to_global(
+        data.local_rhs,
+        data.local_dof_indices,
+        this->rhs_ch
+    );
+}
+
+template<int dim>
+void SCHSolver<dim>::assembleCahnHilliardRHS()
+{
+    this->pcout << "Assembling Cahn-Hilliard RHS" << std::endl;
+    
+    this->rhs_ch = 0;
+
+    auto worker = [this](
+        const typename DoFHandler<dim>::active_cell_iterator    &cell,
+        Assembly::Scratch::CahnHilliardRHS<dim>              &scratch,
+        Assembly::CopyData::CahnHilliardRHS<dim>             &data)
+    {
+        this->assembleCahnHilliardRHSLocal(cell, scratch, data);
+    };
+
+    auto copier = [this](
+        const Assembly::CopyData::CahnHilliardRHS<dim> &data
+    ) {
+        this->copyCahnHilliardRHSLocalToGlobal(data);
+    };
+
+    using CellFilter = FilteredIterator<typename 
+        DoFHandler<dim>::active_cell_iterator>;
+
+    WorkStream::run(
+        CellFilter(IteratorFilters::LocallyOwnedCell(),
+                   dof_handler_ch.begin_active()),
+        CellFilter(IteratorFilters::LocallyOwnedCell(),
+                   dof_handler_ch.end()),
+        worker,
+        copier,
+        Assembly::Scratch::CahnHilliardRHS<dim>(
+            this->fe_ch,
+            this->quad_formula,
+            update_values | update_JxW_values |
+            update_gradients,
+            this->fe_stokes,
+            update_values | update_JxW_values),
+        Assembly::CopyData::CahnHilliardRHS<dim>(
+            this->fe_ch
+        )
+    );
+
+    this->rhs_ch.compress(VectorOperation::add);
+    this->pcout << "Completed" << std::endl;
+
+}
+
+template<int dim>
+void SCHSolver<dim>::solveStokes()
+{
+
+    this->pcout << "Solving Stokes system... " << std::endl;
+
+    TrilinosWrappers::MPI::BlockVector  locally_owned_solution;
+
+    locally_owned_solution.reinit(this->rhs_stokes);
+    locally_owned_solution = this->solution_stokes;
+
+    TrilinosWrappers::PreconditionBlockwiseDirect prec_A;
+    prec_A.initialize(this->matrix_stokes.block(0,0));
+
+    TrilinosWrappers::PreconditionSSOR prec_Mp;
+    prec_Mp.initialize(this->precon_stokes.block(1,1));
+
+    LinearSolvers::BlockDiagonalPreconditioner<
+        TrilinosWrappers::PreconditionBlockwiseDirect,
+        TrilinosWrappers::PreconditionSSOR> 
+            stokes_precon(prec_A, prec_Mp);
+
+    SolverControl sc(100000, 
+                     std::max(1e-8,
+                              1e-8 * this->rhs_stokes.l2_norm())
+                     );
+
+    SolverGMRES<TrilinosWrappers::MPI::BlockVector> solver(sc);
+
+    solver.solve(this->matrix_stokes,
+                 locally_owned_solution,
+                 this->rhs_stokes,
+                 stokes_precon);
+
+    this->constraints_stokes.distribute(locally_owned_solution);
+    this->solution_stokes = locally_owned_solution;
+
+    this->pcout << "Solution norms:\n"
+                << "\tBlock 0: "
+                    << this->solution_stokes.block(0).linfty_norm()
+                << "\n\tBlock 1: " 
+                    << this->solution_stokes.block(1).linfty_norm()
+                << std::endl;
+
+    this->pcout << "Completed" << std::endl;
+
+}
+
+template<int dim>
+void SCHSolver<dim>::computeTimestep()
+{
+
+}
+
+template<int dim>
+void SCHSolver<dim>::solveCahnHilliard()
+{
+
+    this->pcout << "Solving Cahn-Hilliard system... " << std::endl;
+
+    TrilinosWrappers::MPI::BlockVector  locally_owned_solution;
+
+    locally_owned_solution.reinit(this->rhs_ch);
+    locally_owned_solution = this->solution_ch;
+
+    TrilinosWrappers::PreconditionSSOR prec_A;
+    TrilinosWrappers::PreconditionSSOR prec_D;
+
+    prec_A.initialize(this->matrix_ch.block(0,0));
+    prec_D.initialize(this->matrix_ch.block(1,1));
+    
+    LinearSolvers::BlockDiagonalPreconditioner<
+        TrilinosWrappers::PreconditionSSOR,
+        TrilinosWrappers::PreconditionSSOR> ch_precon(prec_A, prec_D);
+
+    SolverControl sc(100000,
+                     std::max(1e-8,
+                              1e-8 * this->rhs_ch.l2_norm()));
+
+    SolverGMRES<TrilinosWrappers::MPI::BlockVector> solver(sc);
+    solver.solve(this->matrix_ch,
+                 locally_owned_solution,
+                 this->rhs_ch,
+                 ch_precon);
+
+    this->constraints_ch.distribute(locally_owned_solution);
+    this->solution_ch = locally_owned_solution;
+
+    this->pcout << "Completed" << std::endl;
+
+}
+
+template<int dim>
+void SCHSolver<dim>::refineGrid()
+{
+    parallel::distributed::SolutionTransfer<
+        dim, TrilinosWrappers::MPI::BlockVector> trans_sol_stokes(
+            this->dof_handler_stokes);
+    
+    parallel::distributed::SolutionTransfer<
+        dim, TrilinosWrappers::MPI::BlockVector> trans_sol_ch(
+            this->dof_handler_ch);
+
+    {
+    Vector<float>               estimated_errors_stokes(
+                                    triangulation.n_active_cells());
+    Vector<float>               estimated_errors_stokes_rhs(
+                                    triangulation.n_active_cells());
+    Vector<float>               estimated_errors_ch(
+                                    triangulation.n_active_cells());
+
+    KellyErrorEstimator<dim>::estimate(
+        this->dof_handler_stokes,
+        QGauss<dim - 1>(degree + 1),
+        std::map<types::boundary_id, const Function<dim> *>(),
+        this->solution_stokes,
+        estimated_errors_stokes,
+        ComponentMask(),
+        nullptr,
+        0,
+        triangulation.locally_owned_subdomain()
+    );
+
+    KellyErrorEstimator<dim>::estimate(
+        this->dof_handler_ch,
+        QGauss<dim - 1>(degree + 1),
+        std::map<types::boundary_id, const Function<dim> *>(),
+        this->solution_ch,
+        estimated_errors_ch,
+        ComponentMask(),
+        nullptr,
+        0,
+        triangulation.locally_owned_subdomain()
+    );
+
+    if(estimated_errors_stokes.l2_norm() > 0)
+        estimated_errors_stokes /= estimated_errors_stokes.l2_norm();
+    if(estimated_errors_ch.l2_norm() > 0)
+        estimated_errors_ch /= estimated_errors_ch.l2_norm();
+
+    Vector<float> max_err(triangulation.n_active_cells());
+    for(uint i = 0; i < max_err.size(); i++)
+        max_err[i] = std::max(estimated_errors_stokes[i],
+                              estimated_errors_ch[i]);
+
+    this->pcout << "Performing refinement..." << std::endl;
+
+    parallel::distributed::GridRefinement::refine_and_coarsen_fixed_fraction(
+        this->triangulation, max_err, 0.8, 0.1);
+
+    this->pcout << "Lock 1" << std::endl;
+
+    std::vector<const TrilinosWrappers::MPI::BlockVector *> x_ch(3);
+    x_ch[0] = &this->solution_ch;
+    x_ch[1] = &this->solution_old_ch;
+    x_ch[2] = &this->solution_old_old_ch;
+    
+    std::vector<const TrilinosWrappers::MPI::BlockVector *> x_stokes(2);
+    x_stokes[0] = &this->solution_stokes;
+    x_stokes[1] = &this->solution_old_stokes;
+
+    this->pcout << "Lock 2" << std::endl;
+
+    this->triangulation.prepare_coarsening_and_refinement();
+
+    trans_sol_ch.prepare_for_coarsening_and_refinement(x_ch);
+    trans_sol_stokes.prepare_for_coarsening_and_refinement(x_stokes);
+
+    this->pcout << "Lock Lomond" << std::endl;
+
+    this->triangulation.execute_coarsening_and_refinement();
+    }
+
+    this->setupDoFs();
+    
+    {
+        TrilinosWrappers::MPI::BlockVector distributed_tmp1(this->rhs_ch);
+        TrilinosWrappers::MPI::BlockVector distributed_tmp2(this->rhs_ch);
+        TrilinosWrappers::MPI::BlockVector distributed_tmp3(this->rhs_ch);
+
+        std::vector<TrilinosWrappers::MPI::BlockVector *> tmp(3);
+        tmp[0] = &(distributed_tmp1);
+        tmp[1] = &(distributed_tmp2);
+        tmp[2] = &(distributed_tmp3);
+        
+        trans_sol_ch.interpolate(tmp);
+
+        this->constraints_ch.distribute(distributed_tmp1);
+        this->constraints_ch.distribute(distributed_tmp2);
+        this->constraints_ch.distribute(distributed_tmp3);
+
+        this->solution_ch = distributed_tmp1;
+        this->solution_old_ch = distributed_tmp2;
+        this->solution_old_old_ch = distributed_tmp3;
+    }
+
+    {
+        TrilinosWrappers::MPI::BlockVector distributed_tmp1(this->rhs_stokes);
+        TrilinosWrappers::MPI::BlockVector distributed_tmp2(this->rhs_stokes);
+
+        std::vector<TrilinosWrappers::MPI::BlockVector *> tmp(2);
+        tmp[0] = &(distributed_tmp1);
+        tmp[1] = &(distributed_tmp2);
+        
+        trans_sol_stokes.interpolate(tmp);
+
+        this->constraints_stokes.distribute(distributed_tmp1);
+        this->constraints_stokes.distribute(distributed_tmp2);
+
+        this->solution_stokes = distributed_tmp1;
+        this->solution_old_stokes = distributed_tmp2;
+    }
+
+}
+
+template<int dim>
+void SCHSolver<dim>::outputStokes()
+{
+    
+    this->pcout << "Generating stokes RHS output" << std::endl;
+    std::vector<std::string> component_names_stokes_rhs(dim, "surface_tension");
+    component_names_stokes_rhs.emplace_back("pressure_rhs");
+
+    std::vector<DataComponentInterpretation::DataComponentInterpretation>
+        data_interp(dim, DataComponentInterpretation::component_is_part_of_vector);
+    data_interp.push_back(DataComponentInterpretation::component_is_scalar);
+    
+    std::vector<std::string> component_names_stokes_sol(dim, "velocity");
+    component_names_stokes_sol.emplace_back("pressure");
+
+    std::vector<uint> stokes_sub_blocks(dim+1,0);
+    stokes_sub_blocks[dim] = 1;
+
+    const std::vector<types::global_dof_index> dofs_per_block =
+        DoFTools::count_dofs_per_fe_block(this->dof_handler_stokes,
+                                          stokes_sub_blocks);
+
+    const types::global_dof_index n_u = dofs_per_block[0],
+                                  n_p = dofs_per_block[1];
+
+    std::vector<IndexSet> stokes_relevant_partitioning;
+    
+    IndexSet stokes_relevant_set;
+    DoFTools::extract_locally_relevant_dofs(this->dof_handler_stokes,
+                                            stokes_relevant_set);
+    stokes_relevant_partitioning.push_back(
+        stokes_relevant_set.get_view(0, n_u));
+    stokes_relevant_partitioning.push_back(
+        stokes_relevant_set.get_view(n_u, n_u+n_p));
+    
+    TrilinosWrappers::MPI::BlockVector locally_rel_stokes_rhs;
+    TrilinosWrappers::MPI::BlockVector locally_rel_stokes_sol;
+    locally_rel_stokes_rhs.reinit(stokes_relevant_partitioning,
+                                  mpi_communicator);
+    locally_rel_stokes_sol.reinit(stokes_relevant_partitioning,
+                                  mpi_communicator);
+
+    locally_rel_stokes_rhs = this->rhs_stokes;
+    locally_rel_stokes_sol = this->solution_stokes;
+
+    DataOut<dim> data_out;
+    data_out.add_data_vector(this->dof_handler_stokes,
+                             locally_rel_stokes_rhs,
+                             component_names_stokes_rhs,
+                             data_interp);
+    data_out.add_data_vector(this->dof_handler_stokes,
+                             locally_rel_stokes_sol,
+                             component_names_stokes_sol,
+                             data_interp);
+
+    Vector<float> subdomain(triangulation.n_active_cells());
+    for (unsigned int i = 0; i < subdomain.size(); ++i)
+        subdomain(i) = triangulation.locally_owned_subdomain();
+    data_out.add_data_vector(subdomain, "subdomain");
+
+    data_out.build_patches();
+
+    data_out.write_vtu_with_pvtu_record("data/", "surface_tension", 0, 
+                                        mpi_communicator, 2);
+
+
+}
+
+template<int dim>
+void SCHSolver<dim>::outputTimestep(const uint timestep_number)
+{
+        TrilinosWrappers::MPI::BlockVector locally_rel_stokes_rhs;
+        TrilinosWrappers::MPI::BlockVector locally_rel_stokes_sol;
+        TrilinosWrappers::MPI::BlockVector locally_rel_ch_sol;
+
+    {
+        std::vector<uint> stokes_sub_blocks(dim+1,0);
+        stokes_sub_blocks[dim] = 1;
+
+        const std::vector<types::global_dof_index> dofs_per_block =
+            DoFTools::count_dofs_per_fe_block(this->dof_handler_stokes,
+                                              stokes_sub_blocks);
+
+        const types::global_dof_index n_u = dofs_per_block[0],
+                                      n_p = dofs_per_block[1];
+
+        std::vector<IndexSet> stokes_relevant_partitioning;
+        
+        IndexSet stokes_relevant_set;
+        DoFTools::extract_locally_relevant_dofs(this->dof_handler_stokes,
+                                                stokes_relevant_set);
+        stokes_relevant_partitioning.push_back(
+            stokes_relevant_set.get_view(0, n_u));
+        stokes_relevant_partitioning.push_back(
+            stokes_relevant_set.get_view(n_u, n_u+n_p));
+        
+        locally_rel_stokes_rhs.reinit(stokes_relevant_partitioning,
+                                      mpi_communicator);
+        locally_rel_stokes_sol.reinit(stokes_relevant_partitioning,
+                                      mpi_communicator);
+
+        locally_rel_stokes_rhs = this->rhs_stokes;
+        locally_rel_stokes_sol = this->solution_stokes;
+    }
+    
+    {
+        std::vector<uint> ch_sub_blocks = {0,1};
+
+        const std::vector<types::global_dof_index> dofs_per_block =
+            DoFTools::count_dofs_per_fe_block(this->dof_handler_ch,
+                                              ch_sub_blocks);
+
+        const types::global_dof_index n_phi = dofs_per_block[0],
+                                      n_eta = dofs_per_block[1];
+
+        std::vector<IndexSet> ch_relevant_partitioning;
+        
+        IndexSet ch_relevant_set;
+        DoFTools::extract_locally_relevant_dofs(this->dof_handler_ch,
+                                                ch_relevant_set);
+        ch_relevant_partitioning.push_back(
+            ch_relevant_set.get_view(0, n_phi));
+        ch_relevant_partitioning.push_back(
+            ch_relevant_set.get_view(n_phi, n_phi+n_eta));
+        
+        locally_rel_ch_sol.reinit(ch_relevant_partitioning,
+                                      mpi_communicator);
+
+        locally_rel_ch_sol = this->solution_ch;
+    }
+
+    this->pcout << "Saving solution at timestep number: " 
+                << timestep_number
+                << std::endl;
+    std::vector<std::string> component_names_stokes_rhs(dim, "surface_tension");
+    component_names_stokes_rhs.emplace_back("pressure_rhs");
+
+    std::vector<DataComponentInterpretation::DataComponentInterpretation>
+        data_interp_stokes(
+            dim, DataComponentInterpretation::component_is_part_of_vector
+        );
+    data_interp_stokes.push_back(
+        DataComponentInterpretation::component_is_scalar
+    );
+    
+    std::vector<std::string> component_names_stokes_sol(dim, "velocity");
+    component_names_stokes_sol.emplace_back("pressure");
+
+    std::vector<std::string> component_names_ch_sol = {"phi", "eta"};
+    std::vector<DataComponentInterpretation::DataComponentInterpretation>
+        data_interp_ch(2, DataComponentInterpretation::component_is_scalar);
+
+    DataOut<dim> data_out;
+    data_out.add_data_vector(this->dof_handler_stokes,
+                             locally_rel_stokes_rhs,
+                             component_names_stokes_rhs,
+                             data_interp_stokes);
+    data_out.add_data_vector(this->dof_handler_stokes,
+                             locally_rel_stokes_sol,
+                             component_names_stokes_sol,
+                             data_interp_stokes);
+    data_out.add_data_vector(this->dof_handler_ch,
+                             locally_rel_ch_sol,
+                             component_names_ch_sol,
+                             data_interp_ch);
+
+    Vector<float> subdomain(triangulation.n_active_cells());
+    for (unsigned int i = 0; i < subdomain.size(); ++i)
+        subdomain(i) = triangulation.locally_owned_subdomain();
+    data_out.add_data_vector(subdomain, "subdomain");
+
+    data_out.build_patches();
+
+    data_out.write_vtu_with_pvtu_record("data/", "solution", timestep_number, 
+                                        mpi_communicator, 2);
+
+}
+
+template<int dim>
+void SCHSolver<dim>::run(bool debug)
 {
    
     this->pcout << "Running" << std::endl;
     this->setupTriang();
     this->setupDoFs();
-    this->initializeValues();
-    this->assembleStokesPrecon();
-    this->assembleStokesMatrix();
-    this->assembleStokesRHS();
+    for(uint i = 0; i < 6; i++)
+    {
+        this->initializeValues();
+        this->assembleStokesPrecon();
+        this->assembleStokesMatrix();
+        this->assembleStokesRHS();
+        this->solveStokes();
 
+        if(debug) this->outputStokes();
+
+        this->assembleCahnHilliardMatrix();
+        this->assembleCahnHilliardRHS();
+        this->solveCahnHilliard();
+
+        this->outputTimestep(i);
+
+        this->refineGrid();
+
+    }
 }
 
 } // stokesCahnHilliard
@@ -1451,7 +2298,7 @@ int main(int argc, char *argv[]){
         );
 
         stokesCahnHilliard::SCHSolver<2> stokesCahnHilliard;
-        stokesCahnHilliard.run();
+        stokesCahnHilliard.run(true);
 
     }
     catch (std::exception &exc)

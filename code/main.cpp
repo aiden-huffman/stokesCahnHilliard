@@ -74,6 +74,7 @@
 #include <deal.II/lac/trilinos_precondition.h>
 #include <deal.II/lac/trilinos_solver.h>
 
+#include <deal.II/numerics/vector_tools_boundary.h>
 #include <ostream>
 #include <random>
 #include <unordered_map>
@@ -757,7 +758,7 @@ SCHSolver<dim>::SCHSolver()
                 )
 , fe_stokes(FE_Q<dim>(degree+1), dim, FE_Q<dim>(degree), 1)
 , fe_ch(FE_Q<dim>(degree), 2)
-, quad_formula(degree+2)
+, quad_formula(degree+3)
 , dof_handler_stokes(this->triangulation)
 , dof_handler_ch(this->triangulation)
 , timestep(1e-2)
@@ -773,55 +774,6 @@ void SCHSolver<dim>::setupTriang()
     GridGenerator::hyper_cube(
       triangulation, -1, 1, true);
  
-    if(dim == 2){
-
-        std::vector<GridTools::PeriodicFacePair<
-            typename Triangulation<dim>::cell_iterator>
-        > matched_pairs_X;
-
-        std::vector<GridTools::PeriodicFacePair<
-            typename Triangulation<dim>::cell_iterator>
-        > matched_pairs_Y;
-
-        GridTools::collect_periodic_faces(this->triangulation,
-                                          0, 1, 0, matched_pairs_X);
-        
-        GridTools::collect_periodic_faces(this->triangulation,
-                                          2, 3, 1, matched_pairs_Y);
-
-        triangulation.add_periodicity(matched_pairs_X);
-        triangulation.add_periodicity(matched_pairs_Y);
-
-    } else if (dim == 3) {
-
-        std::vector<GridTools::PeriodicFacePair<
-            typename Triangulation<dim>::cell_iterator>
-        > matched_pairs_X;
-
-        std::vector<GridTools::PeriodicFacePair<
-            typename Triangulation<dim>::cell_iterator>
-        > matched_pairs_Y;
-        
-        std::vector<GridTools::PeriodicFacePair<
-            typename Triangulation<dim>::cell_iterator>
-        > matched_pairs_Z;
-
-        GridTools::collect_periodic_faces(this->triangulation,
-                                          0, 1, 0, matched_pairs_X);
-        
-        GridTools::collect_periodic_faces(this->triangulation,
-                                          2, 3, 1, matched_pairs_Y);
-
-        GridTools::collect_periodic_faces(this->triangulation,
-                                          4, 5, 2, matched_pairs_Z);
-
-        triangulation.add_periodicity(matched_pairs_X);
-        triangulation.add_periodicity(matched_pairs_Y);
-        triangulation.add_periodicity(matched_pairs_Z);
-    }
-
-    this->pcout << "\tNeighbours updated to reflect periodicity" << std::endl;
-
     this->pcout << "\tRefining grid" << std::endl;
     triangulation.refine_global(6);
 
@@ -873,55 +825,31 @@ void SCHSolver<dim>::setupDoFsStokes()
         DoFTools::make_hanging_node_constraints(this->dof_handler_stokes,
                                                 this->constraints_stokes);
 
-        // Periodicity constraints
-        if(dim == 2){
+        if(Utilities::MPI::this_mpi_process(mpi_communicator) == 0)
+        {
+            FEValuesExtractors::Scalar pressure(dim);
+            ComponentMask pressure_mask = 
+                this->fe_stokes.component_mask(pressure);
 
-            std::vector<GridTools::PeriodicFacePair<
-                typename DoFHandler<dim>::cell_iterator
-            >> periodicity_vectorX;
+            std::vector<IndexSet> pressure_dofs =
+                DoFTools::locally_owned_dofs_per_component(
+                    this->dof_handler_stokes,
+                    pressure_mask
+                );
+            const types::global_dof_index first_pressure_dof
+                = pressure_dofs[dim].nth_index_in_set(0);
+            this->constraints_stokes.add_line(first_pressure_dof);
+        }
 
-            std::vector<GridTools::PeriodicFacePair<
-                typename DoFHandler<dim>::cell_iterator
-            >> periodicity_vectorY;
+        const FEValuesExtractors::Vector velocity(0);
 
-            DoFTools::make_periodicity_constraints<dim,dim>(
-                periodicity_vectorX,
-                this->constraints_stokes
+        for(uint i = 0; i < 4; i++){
+            VectorTools::interpolate_boundary_values(
+                this->dof_handler_stokes,
+                i, Functions::ZeroFunction<dim>(dim+1),
+                this->constraints_stokes,
+                this->fe_stokes.component_mask(velocity)
             );
-            DoFTools::make_periodicity_constraints<dim,dim>(
-                periodicity_vectorY,
-                this->constraints_stokes
-            );
-
-        } else if(dim == 3){
-
-            std::vector<GridTools::PeriodicFacePair<
-                typename DoFHandler<dim>::cell_iterator
-            >> periodicity_vectorX;
-
-            std::vector<GridTools::PeriodicFacePair<
-                typename DoFHandler<dim>::cell_iterator
-            >> periodicity_vectorY;
-            
-            std::vector<GridTools::PeriodicFacePair<
-                typename DoFHandler<dim>::cell_iterator
-            >> periodicity_vectorZ;
-
-            DoFTools::make_periodicity_constraints<dim,dim>(
-                periodicity_vectorX,
-                this->constraints_stokes
-            );
-
-            DoFTools::make_periodicity_constraints<dim,dim>(
-                periodicity_vectorY,
-                this->constraints_stokes
-            );
-
-            DoFTools::make_periodicity_constraints<dim,dim>(
-                periodicity_vectorZ,
-                this->constraints_stokes
-            );
-
         }
 
         this->constraints_stokes.close();
@@ -1020,10 +948,6 @@ void SCHSolver<dim>::setupDoFsCahnHilliard()
 
     const types::global_dof_index n_phi = dofs_per_block[0],
                                   n_eta = dofs_per_block[1];
-
-    this->pcout << "Number of CH DoFS:" << std::endl
-                << "\tBlock 0:" << n_phi << std::endl
-                << "\tBlock 1:" << n_eta << std::endl;
 
     std::vector<IndexSet> ch_partitioning, ch_relevant_partitioning;
     IndexSet ch_relevant_set;
@@ -1320,10 +1244,7 @@ void SCHSolver<dim>::assembleStokesPrecon()
 
     this->precon_stokes.compress(VectorOperation::add);
 
-    this->pcout << "Precon norm: "
-                << this->precon_stokes.block(1,1).frobenius_norm()
-                << std::endl;
-                                                     
+    this->pcout << "Completed" << std::endl;                                                     
 }
 
 template<int dim>
@@ -1881,20 +1802,20 @@ void SCHSolver<dim>::solveStokes()
     TrilinosWrappers::PreconditionBlockwiseDirect prec_A;
     prec_A.initialize(this->matrix_stokes.block(0,0));
 
-    TrilinosWrappers::PreconditionSSOR prec_Mp;
+    TrilinosWrappers::PreconditionBlockwiseDirect prec_Mp;
     prec_Mp.initialize(this->precon_stokes.block(1,1));
 
     LinearSolvers::BlockDiagonalPreconditioner<
         TrilinosWrappers::PreconditionBlockwiseDirect,
-        TrilinosWrappers::PreconditionSSOR> 
+        TrilinosWrappers::PreconditionBlockwiseDirect> 
             stokes_precon(prec_A, prec_Mp);
 
     SolverControl sc(100000, 
-                     std::max(1e-8,
-                              1e-8 * this->rhs_stokes.l2_norm())
+                     std::max(1e-6,
+                              1e-6 * this->rhs_stokes.l2_norm())
                      );
 
-    SolverGMRES<TrilinosWrappers::MPI::BlockVector> solver(sc);
+    SolverFGMRES<TrilinosWrappers::MPI::BlockVector> solver(sc);
 
     solver.solve(this->matrix_stokes,
                  locally_owned_solution,

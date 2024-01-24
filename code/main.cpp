@@ -200,40 +200,37 @@ double InitialValuesPhi<dim>::value(
         Point<dim> shifted_p3 = p;
         Point<dim> shifted_p4 = p;
 
-        shifted_p1[0] -= 0.5;
-        shifted_p1[1] -= 0.5;
+        shifted_p1[0] -= 0.1;
+        shifted_p1[1] -= 0.1;
 
-        shifted_p2[0] += 0.5;
-        shifted_p2[1] += 0.5;
+        shifted_p2[0] += 0.1;
+        shifted_p2[1] += 0.1;
         
-        shifted_p3[0] -= 0.5;
-        shifted_p3[1] += 0.5;
+        shifted_p3[0] -= 0.1;
+        shifted_p3[1] += 0.1;
         
-        shifted_p4[0] += 0.5;
-        shifted_p4[1] -= 0.5;
+        shifted_p4[0] += 0.1;
+        shifted_p4[1] -= 0.1;
 
         std::vector<double> droplets(4);
 
         droplets[0] = std::tanh(
-            (shifted_p1.norm()-0.1) / (std::sqrt(2) * this->eps)
+            (shifted_p1.norm()-0.15) / (std::sqrt(2) * this->eps)
         );
 
         droplets[1] = std::tanh(
-            (shifted_p2.norm()-0.11) / (std::sqrt(2) * this->eps)
+            (shifted_p2.norm()-0.15) / (std::sqrt(2) * this->eps)
         );
 
         droplets[2] = std::tanh(
-            (shifted_p3.norm()-0.12) / (std::sqrt(2) * this->eps)
+            (shifted_p3.norm()-0.15) / (std::sqrt(2) * this->eps)
         );
 
         droplets[3] = std::tanh(
-            (shifted_p4.norm()-0.13) / (std::sqrt(2) * this->eps)
+            (shifted_p4.norm()-0.15) / (std::sqrt(2) * this->eps)
         );
 
-        return std::accumulate(droplets.begin(),
-                               droplets.end(),
-                               1.0,
-                               std::multiplies<double>());
+        return *std::min_element(droplets.begin(),droplets.end());
 
     } else {
         return 0;
@@ -1882,7 +1879,7 @@ double SCHSolver<dim>::computeCFL()
             fe_values[velocity].get_function_values(this->solution_stokes,
                                                     velocity_values);
 
-            double max_vel = 0;
+            double max_vel = 1e-10;
             for(uint q = 0; q < n_q_points; q++)
             {
                 max_vel = std::max(max_vel, velocity_values[q].norm());
@@ -1899,16 +1896,10 @@ template<int dim>
 void SCHSolver<dim>::updateTimestep()
 {
     double cfl = computeCFL();
-
+    this->pcout << "CFL: " << cfl << std::endl;
     this->timestep_old = this->timestep;
     this->timestep = std::min(1e-2,
-                              cfl / (std::sqrt(2) * dim));
-}
-
-template<int dim>
-void SCHSolver<dim>::computeTimestep()
-{
-
+                              2. / (3. * cfl * std::sqrt(2) * dim));
 }
 
 template<int dim>
@@ -1997,6 +1988,8 @@ void SCHSolver<dim>::refineGrid()
         estimated_errors_stokes /= estimated_errors_stokes.l2_norm();
     if(estimated_errors_ch.l2_norm() > 0)
         estimated_errors_ch /= estimated_errors_ch.l2_norm();
+    
+    estimated_errors_ch *= 4.;
 
     Vector<float> max_err(triangulation.n_active_cells());
     for(uint i = 0; i < max_err.size(); i++)
@@ -2006,7 +1999,7 @@ void SCHSolver<dim>::refineGrid()
     this->pcout << "Performing refinement..." << std::endl;
 
     parallel::distributed::GridRefinement::refine_and_coarsen_fixed_fraction(
-        this->triangulation, max_err, 0.8, 0.1);
+        this->triangulation, max_err, 0.5, 0.3);
     if (triangulation.n_levels() > this->max_refine)
     {
         for (typename Triangulation<dim>::active_cell_iterator cell 

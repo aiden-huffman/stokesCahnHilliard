@@ -213,17 +213,17 @@ double InitialValuesPhi<dim>::value(
         shifted_p4[0] += 0.1;
         shifted_p4[1] -= 0.1;
 
-        shifted_p5[0] -= 1;
+        shifted_p5[0] -= 0.8;
         shifted_p5[1] -= 0;
 
-        shifted_p6[0] += 1;
+        shifted_p6[0] += 0.8;
         shifted_p6[1] += 0;
         
         shifted_p7[0] -= 0;
-        shifted_p7[1] += 1;
+        shifted_p7[1] += 0.8;
         
         shifted_p8[0] += 0;
-        shifted_p8[1] -= 1;
+        shifted_p8[1] -= 0.8;
 
         std::vector<double> droplets(8);
 
@@ -359,10 +359,12 @@ namespace Assembly
 
         FEValues<dim>   fe_val_ch;
 
+        std::vector<Tensor<1,dim>> val_phi_u;
         std::vector<Tensor<2,dim>> grad_phi_u;
 
         std::vector<Tensor<2,dim>> grad_outer_phi_q;
         std::vector<Tensor<1,dim>> grad_phi_q;
+        std::vector<double>        val_phi_q;
     };
 
     template<int dim>
@@ -376,9 +378,11 @@ namespace Assembly
                                   quad_stokes,
                                   update_flags_stokes)
     , fe_val_ch(fe_ch, quad_stokes, update_flags_ch)
+    , val_phi_u(fe_stokes.n_dofs_per_cell())
     , grad_phi_u(fe_stokes.n_dofs_per_cell())
     , grad_outer_phi_q(quad_stokes.size())
     , grad_phi_q(quad_stokes.size())
+    , val_phi_q(quad_stokes.size())
     {}
 
     template<int dim>
@@ -390,9 +394,11 @@ namespace Assembly
         scratch.fe_val_ch.get_fe(),
         scratch.fe_val_ch.get_quadrature(),
         scratch.fe_val_ch.get_update_flags())
+    , val_phi_u(scratch.val_phi_u)
     , grad_phi_u(scratch.grad_phi_u)
     , grad_outer_phi_q(scratch.grad_outer_phi_q)
     , grad_phi_q(scratch.grad_phi_q)
+    , val_phi_q(scratch.val_phi_q)
     {}
 
     template<int dim>
@@ -652,8 +658,13 @@ private:
 
     MPI_Comm            mpi_communicator;
     ConditionalOStream  pcout;
+    bool                debug;
 
     double eps;
+    double density_zero;
+    double density_one;
+
+    Tensor<1,dim> gravity;
 
     uint min_refine, max_refine;
 
@@ -778,7 +789,7 @@ template<int dim>
 SCHSolver<dim>::SCHSolver()
 : mpi_communicator(MPI_COMM_WORLD)
 , pcout(std::cout, (Utilities::MPI::this_mpi_process(mpi_communicator) == 0))
-, eps(1e-2)
+, eps(1e-3)
 , min_refine(4)
 , max_refine(11)
 , degree(1)
@@ -787,14 +798,17 @@ SCHSolver<dim>::SCHSolver()
                 Triangulation<dim>::smoothing_on_refinement |
                 Triangulation<dim>::smoothing_on_coarsening)
                 )
-, fe_stokes(FE_Q<dim>(degree+1), dim, FE_Q<dim>(degree), 1)
+, fe_stokes(FE_Q<dim>(degree+1), dim, FE_DGP<dim>(degree), 1)
 , fe_ch(FE_Q<dim>(degree), 2)
-, quad_formula(degree+3)
+, quad_formula(degree+2)
 , dof_handler_stokes(this->triangulation)
 , dof_handler_ch(this->triangulation)
 , timestep(1e-2)
 , timestep_old(timestep)
 , timestep_number(0)
+, density_zero(1)
+, density_one(10)
+, gravity({0., -1.})
 {}
 
 template<int dim>
@@ -1133,14 +1147,16 @@ void SCHSolver<dim>::assembleStokesPreconLocal(
     scratch.fe_val_stokes.reinit(cell);
     cell->get_dof_indices(data.local_dof_indices);
 
+    FEValuesExtractors::Scalar pressure(dim);
+
     data.local_matrix = 0;
 
     for(uint q = 0; q < n_q_points; q++)
     {
 
-        for(uint k = 0; k < n_q_points; k++)
+        for(uint k = 0; k < dofs_per_cell; k++)
         {
-            scratch.phi_p[k] = scratch.fe_val_stokes.shape_value(k, q);
+            scratch.phi_p[k] = scratch.fe_val_stokes[pressure].value(k, q);
         }
 
         for(uint i = 0; i < dofs_per_cell; i++)
@@ -1153,6 +1169,7 @@ void SCHSolver<dim>::assembleStokesPreconLocal(
             }
         }
     }
+
 }
 
 template<int dim>
@@ -1316,13 +1333,6 @@ void SCHSolver<dim>::assembleStokesMatrix()
 
     this->matrix_stokes.compress(VectorOperation::add);
 
-    this->pcout << "Block Norms:\n"
-                << "\tBlock (0,0): " << this->matrix_stokes.block(0,0).frobenius_norm()
-                << "\n\tBlock (0,1): " << this->matrix_stokes.block(0,1).frobenius_norm()
-                << "\n\tBlock (1,0): " << this->matrix_stokes.block(1,0).frobenius_norm()
-                << "\n\tBlock (1,1): " << this->matrix_stokes.block(1,1).frobenius_norm()
-                << std::endl;
-
 }
 
 template<int dim>
@@ -1351,6 +1361,10 @@ void SCHSolver<dim>::assembleStokesRHSLocal(
     FEValuesExtractors::Scalar  pressure(dim);
     FEValuesExtractors::Scalar  phi(0);
 
+    scratch.fe_val_ch[phi].get_function_values(
+        this->solution_old_ch,
+        scratch.val_phi_q
+    );
     scratch.fe_val_ch[phi].get_function_gradients(
         this->solution_old_ch,
         scratch.grad_phi_q
@@ -1373,6 +1387,7 @@ void SCHSolver<dim>::assembleStokesRHSLocal(
 
         for(uint k = 0; k < dofs_per_cell; k++)
         {
+            scratch.val_phi_u[k] = scratch.fe_val_stokes[velocities].value(k,q);
             scratch.grad_phi_u[k] 
                 = scratch.fe_val_stokes[velocities].gradient(k,q);
         }
@@ -1384,6 +1399,12 @@ void SCHSolver<dim>::assembleStokesRHSLocal(
                 * scalar_product(scratch.grad_phi_u[i],
                                  scratch.grad_outer_phi_q[q])
                 * scratch.fe_val_stokes.JxW(q);
+            
+            data.local_rhs(i) += scratch.val_phi_u[i] * gravity * 1. / (
+                (1 + scratch.val_phi_q[q]) / (2. * density_one)
+                + (1 - scratch.val_phi_q[q]) / (2. * density_zero)
+            ) * scratch.fe_val_stokes.JxW(q);
+                
         }
     }
     
@@ -1624,9 +1645,14 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
         this->solution_old_old_ch,
         scratch.phi_grad_old_old_q
     );
-
+    
     scratch.fe_val_stokes[velocities].get_function_values(
         this->solution_stokes,
+        scratch.vel_q
+    );
+
+    scratch.fe_val_stokes[velocities].get_function_values(
+        this->solution_old_stokes,
         scratch.vel_old_q
     );
 
@@ -1670,13 +1696,13 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
                                  ) * scratch.fe_val_ch.JxW(q);
             
             // Advection
-            data.local_rhs(i)    += this->timestep * (1 + timestep_ratio) * (
+            data.local_rhs(i)    -= this->timestep * (1 + timestep_ratio) * (
                                     scratch.fe_val_ch[phi].value(i,q) 
                                     * scratch.vel_q[q] 
                                     * scratch.phi_grad_old_q[q]
                                  ) * scratch.fe_val_ch.JxW(q);
 
-            data.local_rhs(i)    -= this->timestep * timestep_ratio * (
+            data.local_rhs(i)    += this->timestep * timestep_ratio * (
                                     scratch.fe_val_ch[phi].value(i,q) 
                                     * scratch.vel_old_q[q] 
                                     * scratch.phi_grad_old_old_q[q]
@@ -1751,6 +1777,18 @@ void SCHSolver<dim>::solveStokes()
 {
 
     this->pcout << "Solving Stokes system... " << std::endl;
+    
+    if(this->debug)
+    {
+        this->pcout << "Block Norms:\n"
+                    << "\tBlock (0,0): " << this->matrix_stokes.block(0,0).frobenius_norm()
+                    << "\n\tBlock (0,1): " << this->matrix_stokes.block(0,1).frobenius_norm()
+                    << "\n\tBlock (1,0): " << this->matrix_stokes.block(1,0).frobenius_norm()
+                    << "\n\tBlock (1,1): " << this->matrix_stokes.block(1,1).frobenius_norm()
+                    << "\n\tPrecon Block (1,1): " << this->precon_stokes.block(1,1).frobenius_norm()
+                    << std::endl;
+    }
+
 
     TrilinosWrappers::MPI::BlockVector  locally_owned_solution;
 
@@ -1909,7 +1947,7 @@ void SCHSolver<dim>::refineGrid()
         this->dof_handler_stokes,
         QGauss<dim - 1>(degree + 1),
         std::map<types::boundary_id, const Function<dim> *>(),
-        this->solution_stokes,
+        this->rhs_stokes,
         estimated_errors_stokes,
         ComponentMask(),
         nullptr,
@@ -1936,7 +1974,7 @@ void SCHSolver<dim>::refineGrid()
     if(estimated_errors_ch.l2_norm() > 0)
         estimated_errors_ch /= estimated_errors_ch.l2_norm();
     
-    estimated_errors_ch *= 8.;
+    estimated_errors_ch *= 10.;
 
     Vector<float> max_err(triangulation.n_active_cells());
     for(uint i = 0; i < max_err.size(); i++)
@@ -1946,7 +1984,7 @@ void SCHSolver<dim>::refineGrid()
     this->pcout << "Performing refinement..." << std::endl;
 
     parallel::distributed::GridRefinement::refine_and_coarsen_fixed_fraction(
-        this->triangulation, max_err, 0.5, 0.3);
+        this->triangulation, max_err, 0.65, 0.3);
     if (triangulation.n_levels() > this->max_refine)
     {
         for (typename Triangulation<dim>::active_cell_iterator cell 
@@ -2210,40 +2248,62 @@ void SCHSolver<dim>::outputTimestep(const uint timestep_number)
 template<int dim>
 void SCHSolver<dim>::run(bool debug)
 {
-   
+    this->debug = debug;
     this->pcout << "Running" << std::endl;
     this->setupTriang();
     this->setupDoFs();
 
-    for(uint i = 0; i < 100; i++)
+    bool refineFlag = true;
+
+    for(uint i = 0; i < 10000; i++)
     {
-        if(i < 6)
+        if(i < 10)
         {
             this->initializeValues();
+            refineFlag = true;
         }
-        this->assembleStokesPrecon();
-        this->assembleStokesMatrix();
-        this->assembleStokesRHS();
-        this->solveStokes();
+        if(refineFlag)
+        {
+            this->assembleStokesPrecon();
+            this->assembleStokesMatrix();
+            this->assembleStokesRHS();
+
+            this->solveStokes();
+            this->updateTimestep();
+
+            this->assembleCahnHilliardMatrix();
+
+            refineFlag = false;
+        } else {
+
+            this->assembleStokesRHS();
+            this->solveStokes();
+
+        }
 
     	//if(debug) this->outputStokes();
 
-        this->updateTimestep();
         this->pcout << "Current timestep: " << this->timestep << std::endl;
-        this->assembleCahnHilliardMatrix();
         this->assembleCahnHilliardRHS();
         this->solveCahnHilliard();
 
-        this->outputTimestep(i);
-
-        this->refineGrid();
-
-        if(i >= 6)
+        if(i >= 10)
         {
             this->solution_old_stokes   = this->solution_stokes;
             this->solution_old_old_ch   = this->solution_old_ch;
             this->solution_old_ch       = this->solution_ch;
+
+            if(i % 10 == 0){
+                this->outputTimestep(i/10);
+            }
         }
+        
+        if(i % 3 == 0 or i < 10)
+        {
+            this->refineGrid();
+            refineFlag = true;
+        }
+
 
     }
 }

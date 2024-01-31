@@ -76,6 +76,7 @@
 #include <deal.II/lac/trilinos_solver.h>
 
 #include <deal.II/numerics/vector_tools_boundary.h>
+#include <deal.II/numerics/vector_tools_constraints.h>
 #include <ostream>
 
 namespace stokesCahnHilliard {
@@ -213,17 +214,17 @@ double InitialValuesPhi<dim>::value(
         shifted_p4[0] += 0.1;
         shifted_p4[1] -= 0.1;
 
-        shifted_p5[0] -= 1;
+        shifted_p5[0] -= 0.8;
         shifted_p5[1] -= 0;
 
-        shifted_p6[0] += 1;
+        shifted_p6[0] += 0.8;
         shifted_p6[1] += 0;
         
         shifted_p7[0] -= 0;
-        shifted_p7[1] += 1;
+        shifted_p7[1] += 0.8;
         
         shifted_p8[0] += 0;
-        shifted_p8[1] -= 1;
+        shifted_p8[1] -= 0.8;
 
         std::vector<double> droplets(8);
 
@@ -417,6 +418,7 @@ namespace Assembly
         std::vector<Tensor<1,dim>>  phi_grad;
         std::vector<double>         eta_val;
         std::vector<Tensor<1,dim>>  eta_grad;
+        std::vector<double>         phi_q;
 
     };
     
@@ -430,6 +432,7 @@ namespace Assembly
     , phi_grad(fe_ch.n_dofs_per_cell())
     , eta_val(fe_ch.n_dofs_per_cell())
     , eta_grad(fe_ch.n_dofs_per_cell())
+    , phi_q(quad_ch.size())
     {}
 
     template<int dim>
@@ -442,6 +445,7 @@ namespace Assembly
     , phi_grad(scratch.phi_grad)
     , eta_val(scratch.eta_val)
     , eta_grad(scratch.eta_grad)
+    , phi_q(scratch.phi_q)
     {}
 
     template<int dim>
@@ -461,11 +465,17 @@ namespace Assembly
         std::vector<double>         phi_val;
         std::vector<Tensor<1,dim>>  phi_grad;
 
+        std::vector<double>         phi_q;
         std::vector<double>         phi_old_q;
         std::vector<double>         phi_old_old_q;
 
+        std::vector<double>         eta_q;
+
+        std::vector<Tensor<1,dim>>  phi_grad_q;
         std::vector<Tensor<1,dim>>  phi_grad_old_q;
-        std::vector<Tensor<1,dim>>         phi_grad_old_old_q;
+        std::vector<Tensor<1,dim>>  phi_grad_old_old_q;
+
+        std::vector<Tensor<1,dim>>  eta_grad_q;
 
         std::vector<Tensor<1,dim>>  vel_q;
         std::vector<Tensor<1,dim>>  vel_old_q;
@@ -487,10 +497,14 @@ namespace Assembly
                     update_flags_stokes)
     , phi_val(fe_ch.n_dofs_per_cell())
     , phi_grad(fe_ch.n_dofs_per_cell())
+    , phi_q(quad_ch.size())
     , phi_old_q(quad_ch.size())
     , phi_old_old_q(quad_ch.size())
+    , eta_q(quad_ch.size())
+    , phi_grad_q(quad_ch.size())
     , phi_grad_old_q(quad_ch.size())
     , phi_grad_old_old_q(quad_ch.size())
+    , eta_grad_q(quad_ch.size())
     , vel_q(quad_ch.size())
     , vel_old_q(quad_ch.size())
     {}
@@ -508,10 +522,14 @@ namespace Assembly
         scratch.fe_val_stokes.get_update_flags())
     , phi_val(scratch.phi_val)
     , phi_grad(scratch.phi_grad)
+    , phi_q(scratch.phi_q)
     , phi_old_q(scratch.phi_old_q)
     , phi_old_old_q(scratch.phi_old_q)
+    , eta_q(scratch.eta_q)
+    , phi_grad_q(scratch.phi_grad_q)
     , phi_grad_old_q(scratch.phi_grad_old_q)
     , phi_grad_old_old_q(scratch.phi_grad_old_q)
+    , eta_grad_q(scratch.eta_grad_q)
     , vel_q(scratch.vel_old_q)
     , vel_old_q(scratch.vel_old_q)
     {}
@@ -778,11 +796,12 @@ private:
     void   updateTimestep();
 
     // Grid Refinement
-    void refineGrid();
+    void refineGrid(bool warmup=false);
 
     // Output functions
     void outputStokes();
     void outputTimestep(const uint timestep_number);
+    void printCHSolutionRange();
 };
 
 template<int dim>
@@ -1088,48 +1107,8 @@ void SCHSolver<dim>::initializeValues()
     this->solution_ch = interp_tmp;
     this->solution_old_ch       = this->solution_ch;
     this->solution_old_old_ch   = this->solution_ch;
-
-    FEValuesExtractors::Scalar phi(0);
-    FEValuesExtractors::Scalar eta(1);
-
-    ComponentMask phi_mask = this->fe_ch.component_mask(phi);
-    ComponentMask eta_mask = this->fe_ch.component_mask(eta);
-
-    auto phi_dofs = DoFTools::locally_owned_dofs_per_component(
-        this->dof_handler_ch, phi_mask)[0];
-    auto eta_dofs = DoFTools::locally_owned_dofs_per_component(
-        this->dof_handler_ch, eta_mask)[1];
-
-    TrilinosWrappers::MPI::Vector local_phi(phi_dofs,
-                                            mpi_communicator);
-    TrilinosWrappers::MPI::Vector local_eta(eta_dofs,
-                                            mpi_communicator);
-
-    this->solution_ch.extract_subvector_to(phi_dofs.begin(), phi_dofs.end(), local_phi.begin());
-    this->solution_ch.extract_subvector_to(eta_dofs.begin(), eta_dofs.end(), local_eta.begin());
-
-    auto phi_range = std::minmax_element(
-        local_phi.begin(),
-        local_phi.end());
-    auto eta_range = std::minmax_element(
-        local_eta.begin(),
-        local_eta.end());
-
-    this->pcout << "Initial values propagated:\n"
-                << "    Phi Range: (" 
-                    << Utilities::MPI::min(*phi_range.first,
-                                           mpi_communicator) << ", " 
-                    << Utilities::MPI::max(*phi_range.second,
-                                           mpi_communicator)
-                << ")" 
-                << std::endl;
-    this->pcout << "    Eta Range: (" 
-                    << Utilities::MPI::min(*eta_range.first,
-                                           mpi_communicator) << ", " 
-                    << Utilities::MPI::max(*eta_range.second,
-                                           mpi_communicator)
-                << ")" 
-                << std::endl;
+    
+    if(debug) this->printCHSolutionRange();
 }
 
 template<int dim>
@@ -1494,6 +1473,11 @@ void SCHSolver<dim>::assembleCahnHilliardMatrixLocal(
     FEValuesExtractors::Scalar  phi(0);
     FEValuesExtractors::Scalar  eta(1);
 
+    scratch.fe_val_ch[phi].get_function_values(
+        this->solution_ch,
+        scratch.phi_q
+    );
+
     for(uint q = 0; q < n_q_points; q++)
     {
 
@@ -1522,10 +1506,15 @@ void SCHSolver<dim>::assembleCahnHilliardMatrixLocal(
                     *   scratch.phi_grad[i] * scratch.eta_grad[j]
                     *   scratch.fe_val_ch.JxW(q);
 
-                // (1,0): - (2 M + epsilon^2 A)
+                // (1,0): M - 3 * (phi^{n-1})^2 - epsilon^2 A
                 data.local_matrix(i,j)
-                    -=  2.0 * scratch.eta_val[i] * scratch.phi_val[j]
+                    +=  scratch.eta_val[i] * scratch.phi_val[j]
                         * scratch.fe_val_ch.JxW(q);
+
+                data.local_matrix(i,j)
+                    -= scratch.eta_val[i] * scratch.phi_val[j]
+                    * 3 * std::pow(scratch.phi_q[q],2)
+                    * scratch.fe_val_ch.JxW(q);
 
                 data.local_matrix(i,j)
                     -=  pow(this->eps,2)
@@ -1626,6 +1615,27 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
 
     FEValuesExtractors::Vector  velocities(0);
     FEValuesExtractors::Scalar  phi(0);
+    FEValuesExtractors::Scalar  eta(1);
+
+    scratch.fe_val_ch[phi].get_function_values(
+        this->solution_ch,
+        scratch.phi_q
+    );
+
+    scratch.fe_val_ch[eta].get_function_values(
+        this->solution_ch,
+        scratch.eta_q
+    );
+
+    scratch.fe_val_ch[phi].get_function_gradients(
+        this->solution_ch,
+        scratch.phi_grad_q
+    );
+    
+    scratch.fe_val_ch[eta].get_function_gradients(
+        this->solution_ch,
+        scratch.eta_grad_q
+    );
 
     scratch.fe_val_ch[phi].get_function_values(
         this->solution_old_ch,
@@ -1635,7 +1645,6 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
         this->solution_old_old_ch,
         scratch.phi_old_old_q
     );
-
 
     scratch.fe_val_ch[phi].get_function_gradients(
         this->solution_old_ch,
@@ -1648,6 +1657,10 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
 
     scratch.fe_val_stokes[velocities].get_function_values(
         this->solution_stokes,
+        scratch.vel_q
+    );
+    scratch.fe_val_stokes[velocities].get_function_values(
+        this->solution_old_stokes,
         scratch.vel_old_q
     );
 
@@ -1655,53 +1668,53 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
     {
         for(uint i = 0; i < dofs_per_cell; i++)
         { 
-            // <\varphi_i, phi_old>
-            data.local_rhs(i) +=  (1 + timestep_ratio) 
-                              *  scratch.fe_val_ch[phi].value(i,q)
-                              *  scratch.phi_old_q[q] 
-                              *  scratch.fe_val_ch.JxW(q);
+            // Candidate phi^n - RHS = 0
+            data.local_rhs(i) += (1 + 2 * timestep_ratio) / (1 + timestep_ratio)
+                * scratch.fe_val_ch[phi].value(i,q)
+                * scratch.phi_q[q]
+                * scratch.fe_val_ch.JxW(q);
 
+            // <\varphi_i, phi_old>
+            data.local_rhs(i) += (1 + timestep_ratio) 
+                              * scratch.fe_val_ch[phi].value(i,q)
+                              * scratch.phi_old_q[q] 
+                              * scratch.fe_val_ch.JxW(q);
+            
             data.local_rhs(i) -= std::pow(timestep_ratio,2) / (1 + timestep_ratio)
                               * scratch.fe_val_ch[phi].value(i,q)
                               * scratch.phi_old_old_q[q]
                               * scratch.fe_val_ch.JxW(q);
-
-            // 3 k <\nabla\varphi_i, \nabla\phi_old>
-            data.local_rhs(i)    +=  3.0 * this->timestep * (1 + timestep_ratio)
-                            *   scratch.fe_val_ch[phi].gradient(i, q)
-                            *   scratch.phi_grad_old_q[q]
-                            *   scratch.fe_val_ch.JxW(q);
             
-            data.local_rhs(i)    -=  3.0 * this->timestep * timestep_ratio
-                            *   scratch.fe_val_ch[phi].gradient(i, q)
-                            *   scratch.phi_grad_old_old_q[q]
-                            *   scratch.fe_val_ch.JxW(q);
+            data.local_rhs(i) += this->timestep 
+                              * scratch.fe_val_ch[phi].gradient(i,q)
+                              * scratch.eta_grad_q[q]
+                              * scratch.fe_val_ch.JxW(q);
 
-            // - k <\nabla\varphi_i, 3(\phi_old)^2 \nabla\phi_old>
-            data.local_rhs(i)    -=  this->timestep * (1 + timestep_ratio) * (
-                                    scratch.fe_val_ch[phi].gradient(i,q)
-                                    * 3.0 * pow(scratch.phi_old_q[q],2) 
-                                    * scratch.phi_grad_old_q[q]
-                                 ) * scratch.fe_val_ch.JxW(q);
-
-            data.local_rhs(i)    +=  this->timestep * timestep_ratio * (
-                                    scratch.fe_val_ch[phi].gradient(i,q)
-                                    * 3.0 * pow(scratch.phi_old_old_q[q],2) 
-                                    * scratch.phi_grad_old_old_q[q]
-                                 ) * scratch.fe_val_ch.JxW(q);
-            
             // Advection
-            data.local_rhs(i)    += this->timestep * (1 + timestep_ratio) * (
+            data.local_rhs(i)    -= this->timestep * (1 + timestep_ratio) * (
                                     scratch.fe_val_ch[phi].value(i,q) 
                                     * scratch.vel_q[q] 
                                     * scratch.phi_grad_old_q[q]
                                  ) * scratch.fe_val_ch.JxW(q);
 
-            data.local_rhs(i)    -= this->timestep * timestep_ratio * (
+            data.local_rhs(i)    += this->timestep * timestep_ratio * (
                                     scratch.fe_val_ch[phi].value(i,q) 
                                     * scratch.vel_old_q[q] 
                                     * scratch.phi_grad_old_old_q[q]
                                  ) * scratch.fe_val_ch.JxW(q);
+
+            // Candidate eta^n - RHS = 0
+            data.local_rhs(i) += scratch.fe_val_ch[eta].value(i,q)
+                * scratch.eta_q[q]
+                * scratch.fe_val_ch.JxW(q);
+            
+            data.local_rhs(i) += scratch.fe_val_ch[eta].value(i,q)
+                * (scratch.phi_q[q] - std::pow(scratch.phi_q[q],3))
+                * scratch.fe_val_ch.JxW(q);
+
+            data.local_rhs(i) += scratch.fe_val_ch[eta].gradient(i,q)
+                * std::pow(this->eps, 2) * scratch.phi_grad_q[q]
+                * scratch.fe_val_ch.JxW(q);
         }
     }
 
@@ -1901,26 +1914,51 @@ void SCHSolver<dim>::solveCahnHilliard()
     this->pcout << "Solving Cahn-Hilliard system... " << std::endl;
 
     TrilinosWrappers::MPI::Vector  locally_owned_solution;
+    TrilinosWrappers::MPI::Vector  delta_vector;
 
     locally_owned_solution.reinit(this->rhs_ch);
+    delta_vector.reinit(this->rhs_ch);
+
     locally_owned_solution = this->solution_ch;
 
-    SolverControl sc;
+    double residual = 1e8;
+    uint solve_count = 0;
 
-    TrilinosWrappers::SolverDirect solver(sc);
-    solver.solve(this->matrix_ch,
-                 locally_owned_solution,
-                 this->rhs_ch);
+    while(residual > 1e-8 and solve_count < 10000)
+    {
+        solve_count++;
 
-    this->constraints_ch.distribute(locally_owned_solution);
-    this->solution_ch = locally_owned_solution;
+        this->assembleCahnHilliardMatrix();
+        this->assembleCahnHilliardRHS();
 
-    this->pcout << "Completed in " << sc.last_step() << " steps" << std::endl;
+        SolverControl sc;
+        TrilinosWrappers::SolverDirect solver(sc);
+
+        solver.solve(this->matrix_ch,
+                     delta_vector,
+                     this->rhs_ch);
+        delta_vector *= -1. * std::min(1., 10./delta_vector.l2_norm());
+        locally_owned_solution += delta_vector;
+
+        this->constraints_ch.distribute(locally_owned_solution);
+        this->solution_ch = locally_owned_solution;
+        
+        this->assembleCahnHilliardRHS();
+        residual = this->rhs_ch.linfty_norm();
+        if(debug) this->pcout   << "Residual: " 
+                                << residual 
+                                << "\tStep: "
+                                << solve_count
+                                << std::endl;
+
+        if(debug) this->printCHSolutionRange();
+
+    }
 
 }
 
 template<int dim>
-void SCHSolver<dim>::refineGrid()
+void SCHSolver<dim>::refineGrid(bool warmup)
 {
     parallel::distributed::SolutionTransfer<
         dim, TrilinosWrappers::MPI::BlockVector> trans_sol_stokes(
@@ -1963,6 +2001,8 @@ void SCHSolver<dim>::refineGrid()
         0,
         triangulation.locally_owned_subdomain()
     );
+
+    if(warmup) estimated_errors_stokes *= 0;
 
     if(estimated_errors_stokes.l2_norm() > 0)
         estimated_errors_stokes /= estimated_errors_stokes.l2_norm();
@@ -2047,6 +2087,52 @@ void SCHSolver<dim>::refineGrid()
         this->solution_old_stokes = distributed_tmp2;
     }
 
+}
+
+template<int dim>
+void SCHSolver<dim>::printCHSolutionRange()
+{
+    FEValuesExtractors::Scalar phi(0);
+    FEValuesExtractors::Scalar eta(1);
+
+    ComponentMask phi_mask = this->fe_ch.component_mask(phi);
+    ComponentMask eta_mask = this->fe_ch.component_mask(eta);
+
+    auto phi_dofs = DoFTools::locally_owned_dofs_per_component(
+        this->dof_handler_ch, phi_mask)[0];
+    auto eta_dofs = DoFTools::locally_owned_dofs_per_component(
+        this->dof_handler_ch, eta_mask)[1];
+
+    TrilinosWrappers::MPI::Vector local_phi(phi_dofs,
+                                            mpi_communicator);
+    TrilinosWrappers::MPI::Vector local_eta(eta_dofs,
+                                            mpi_communicator);
+
+    this->solution_ch.extract_subvector_to(phi_dofs.begin(), phi_dofs.end(), local_phi.begin());
+    this->solution_ch.extract_subvector_to(eta_dofs.begin(), eta_dofs.end(), local_eta.begin());
+
+    auto phi_range = std::minmax_element(
+        local_phi.begin(),
+        local_phi.end());
+    auto eta_range = std::minmax_element(
+        local_eta.begin(),
+        local_eta.end());
+
+    this->pcout << "Cahn-Hilliard Range:\n"
+                << "    Phi Range: (" 
+                    << Utilities::MPI::min(*phi_range.first,
+                                           mpi_communicator) << ", " 
+                    << Utilities::MPI::max(*phi_range.second,
+                                           mpi_communicator)
+                << ")" 
+                << std::endl;
+    this->pcout << "    Eta Range: (" 
+                    << Utilities::MPI::min(*eta_range.first,
+                                           mpi_communicator) << ", " 
+                    << Utilities::MPI::max(*eta_range.second,
+                                           mpi_communicator)
+                << ")" 
+                << std::endl;
 }
 
 template<int dim>
@@ -2248,59 +2334,49 @@ void SCHSolver<dim>::run(bool debug)
     this->setupTriang();
     this->setupDoFs();
 
-    bool refineFlag = true;
-
-    for(uint i = 0; i < 10000; i++)
+    for(uint i = 0; i < 10; i++)
     {
-        if(i < 10)
-        {
-            this->initializeValues();
-            refineFlag = true;
-        }
-        if(refineFlag)
-        {
-            this->assembleStokesPrecon();
-            this->assembleStokesMatrix();
-            this->assembleStokesRHS();
+        this->initializeValues();
+        this->assembleStokesPrecon();
+        this->assembleStokesMatrix();
+        this->assembleStokesRHS();
 
-            this->solveStokes();
-            this->updateTimestep();
+        this->solveStokes();
+        this->updateTimestep();
+        this->timestep_old = this->timestep;
+        this->timestep = 0;
 
-            this->assembleCahnHilliardMatrix();
-
-            refineFlag = false;
-        } else {
-
-            this->assembleStokesRHS();
-            this->solveStokes();
-
-        }
-
-    	//if(debug) this->outputStokes();
-
-        this->pcout << "Current timestep: " << this->timestep << std::endl;
-        this->assembleCahnHilliardRHS();
         this->solveCahnHilliard();
 
-        if(i >= 10)
-        {
-            this->solution_old_stokes   = this->solution_stokes;
-            this->solution_old_old_ch   = this->solution_old_ch;
-            this->solution_old_ch       = this->solution_ch;
+        this->outputTimestep(i);
 
-            if(i % 10 == 0){
-                this->outputTimestep(i/10);
-            }
-        }
-        
-        if(i % 3 == 0 or i < 10)
-        {
-            this->refineGrid();
-            refineFlag = true;
-        }
-
-
+        this->refineGrid(true);
     }
+
+    this->timestep = 1e-2;
+
+    for(uint i = 0; i < 100; i++)
+    {
+        
+        this->assembleStokesPrecon();
+        this->assembleStokesMatrix();
+        this->assembleStokesRHS();
+
+        this->solveStokes();
+
+        this->timestep_old = this->timestep;
+        this->updateTimestep();
+
+        this->solveCahnHilliard();
+
+        this->solution_old_stokes   = this->solution_stokes;
+        this->solution_old_old_ch   = this->solution_old_ch;
+        this->solution_old_ch       = this->solution_ch;
+
+        this->outputTimestep(i);
+        this->refineGrid();
+    }
+
 }
 
 } // stokesCahnHilliard

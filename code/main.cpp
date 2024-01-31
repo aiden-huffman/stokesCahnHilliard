@@ -213,17 +213,17 @@ double InitialValuesPhi<dim>::value(
         shifted_p4[0] += 0.1;
         shifted_p4[1] -= 0.1;
 
-        shifted_p5[0] -= 1;
+        shifted_p5[0] -= 0.8;
         shifted_p5[1] -= 0;
 
-        shifted_p6[0] += 1;
+        shifted_p6[0] += 0.8;
         shifted_p6[1] += 0;
         
         shifted_p7[0] -= 0;
-        shifted_p7[1] += 1;
+        shifted_p7[1] += 0.8;
         
         shifted_p8[0] += 0;
-        shifted_p8[1] -= 1;
+        shifted_p8[1] -= 0.8;
 
         std::vector<double> droplets(8);
 
@@ -798,7 +798,7 @@ SCHSolver<dim>::SCHSolver()
                 Triangulation<dim>::smoothing_on_refinement |
                 Triangulation<dim>::smoothing_on_coarsening)
                 )
-, fe_stokes(FE_Q<dim>(degree+1), dim, FE_Q<dim>(degree), 1)
+, fe_stokes(FE_Q<dim>(degree+1), dim, FE_DGP<dim>(degree), 1)
 , fe_ch(FE_Q<dim>(degree), 2)
 , quad_formula(degree+2)
 , dof_handler_stokes(this->triangulation)
@@ -1645,9 +1645,14 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
         this->solution_old_old_ch,
         scratch.phi_grad_old_old_q
     );
-
+    
     scratch.fe_val_stokes[velocities].get_function_values(
         this->solution_stokes,
+        scratch.vel_q
+    );
+
+    scratch.fe_val_stokes[velocities].get_function_values(
+        this->solution_old_stokes,
         scratch.vel_old_q
     );
 
@@ -1691,13 +1696,13 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
                                  ) * scratch.fe_val_ch.JxW(q);
             
             // Advection
-            data.local_rhs(i)    += this->timestep * (1 + timestep_ratio) * (
+            data.local_rhs(i)    -= this->timestep * (1 + timestep_ratio) * (
                                     scratch.fe_val_ch[phi].value(i,q) 
                                     * scratch.vel_q[q] 
                                     * scratch.phi_grad_old_q[q]
                                  ) * scratch.fe_val_ch.JxW(q);
 
-            data.local_rhs(i)    -= this->timestep * timestep_ratio * (
+            data.local_rhs(i)    += this->timestep * timestep_ratio * (
                                     scratch.fe_val_ch[phi].value(i,q) 
                                     * scratch.vel_old_q[q] 
                                     * scratch.phi_grad_old_old_q[q]

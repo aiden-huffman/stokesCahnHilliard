@@ -1,6 +1,7 @@
 code/CMakeFiles/*
 code/.cache/*
 code/build/*
+code/data/*
 
 Makefile
 cmake_install.cmake

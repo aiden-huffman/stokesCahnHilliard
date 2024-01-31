@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.13.4)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(deal.II 9.3.0 REQUIRED
+find_package(deal.II 9.5.1 REQUIRED
     HINTS ${DEAL_II_DIR} ../ ../../ $ENV{DEAL_II_DIR}
     )
 deal_ii_initialize_cached_variables()

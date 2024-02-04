@@ -817,7 +817,7 @@ SCHSolver<dim>::SCHSolver()
                 Triangulation<dim>::smoothing_on_refinement |
                 Triangulation<dim>::smoothing_on_coarsening)
                 )
-, fe_stokes(FE_Q<dim>(degree+1), dim, FE_Q<dim>(degree), 1)
+, fe_stokes(FE_Q<dim>(degree+1), dim, FE_DGP<dim>(degree), 1)
 , fe_ch(FE_Q<dim>(degree), 2)
 , quad_formula(degree+2)
 , dof_handler_stokes(this->triangulation)
@@ -1506,13 +1506,13 @@ void SCHSolver<dim>::assembleCahnHilliardMatrixLocal(
                     *   scratch.phi_grad[i] * scratch.eta_grad[j]
                     *   scratch.fe_val_ch.JxW(q);
 
-                // (1,0): M - 3 * (phi^{n-1})^2 - epsilon^2 A
+                // (1,0): -M + 3 * (phi^{n-1})^2 - epsilon^2 A
                 data.local_matrix(i,j)
-                    +=  scratch.eta_val[i] * scratch.phi_val[j]
+                    -=  scratch.eta_val[i] * scratch.phi_val[j]
                         * scratch.fe_val_ch.JxW(q);
 
                 data.local_matrix(i,j)
-                    -= scratch.eta_val[i] * scratch.phi_val[j]
+                    += scratch.eta_val[i] * scratch.phi_val[j]
                     * 3 * std::pow(scratch.phi_q[q],2)
                     * scratch.fe_val_ch.JxW(q);
 
@@ -1708,11 +1708,11 @@ void SCHSolver<dim>::assembleCahnHilliardRHSLocal(
                 * scratch.eta_q[q]
                 * scratch.fe_val_ch.JxW(q);
             
-            data.local_rhs(i) += scratch.fe_val_ch[eta].value(i,q)
+            data.local_rhs(i) -= scratch.fe_val_ch[eta].value(i,q)
                 * (scratch.phi_q[q] - std::pow(scratch.phi_q[q],3))
                 * scratch.fe_val_ch.JxW(q);
 
-            data.local_rhs(i) += scratch.fe_val_ch[eta].gradient(i,q)
+            data.local_rhs(i) -= scratch.fe_val_ch[eta].gradient(i,q)
                 * std::pow(this->eps, 2) * scratch.phi_grad_q[q]
                 * scratch.fe_val_ch.JxW(q);
         }

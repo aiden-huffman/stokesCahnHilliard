@@ -76,6 +76,7 @@
 #include <deal.II/lac/trilinos_solver.h>
 
 #include <deal.II/numerics/vector_tools_boundary.h>
+#include <deal.II/numerics/vector_tools_mean_value.h>
 #include <ostream>
 
 namespace stokesCahnHilliard {
@@ -807,8 +808,8 @@ SCHSolver<dim>::SCHSolver()
 , timestep_old(timestep)
 , timestep_number(0)
 , density_zero(1)
-, density_one(10)
-, gravity({0., -1.})
+, density_one(1)
+, gravity({0., 0.})
 {}
 
 template<int dim>
@@ -818,7 +819,26 @@ void SCHSolver<dim>::setupTriang()
  
     GridGenerator::hyper_cube(
       triangulation, -1, 1, true);
- 
+
+    if(dim == 2)
+    {
+
+        std::vector<GridTools::PeriodicFacePair<
+            typename Triangulation<dim>::cell_iterator>
+        > matched_pairs_X;
+        std::vector<GridTools::PeriodicFacePair<
+            typename Triangulation<dim>::cell_iterator>
+        > matched_pairs_Y;
+        GridTools::collect_periodic_faces(this->triangulation,
+                                          0, 1, 0, matched_pairs_X);
+        
+        GridTools::collect_periodic_faces(this->triangulation,
+                                          2, 3, 1, matched_pairs_Y);
+
+        triangulation.add_periodicity(matched_pairs_X);
+        triangulation.add_periodicity(matched_pairs_Y);
+    }
+
     this->pcout << "\tRefining grid" << std::endl;
     triangulation.refine_global(6);
 
@@ -867,7 +887,7 @@ void SCHSolver<dim>::setupDoFsStokes()
     {
         this->constraints_stokes.clear();
         this->constraints_stokes.reinit(stokes_relevant_set);
-
+        
         DoFTools::make_hanging_node_constraints(this->dof_handler_stokes,
                                                 this->constraints_stokes);
 
@@ -887,16 +907,25 @@ void SCHSolver<dim>::setupDoFsStokes()
             this->constraints_stokes.add_line(first_pressure_dof);
         }
 
-        const FEValuesExtractors::Vector velocity(0);
+        // Add the periodic constraints
+        std::vector<GridTools::PeriodicFacePair<
+            typename DoFHandler<dim>::cell_iterator>
+        > periodicity_vectorX;
 
-        for(uint i = 0; i < 4; i++){
-            VectorTools::interpolate_boundary_values(
-                this->dof_handler_stokes,
-                i, Functions::ZeroFunction<dim>(dim+1),
-                this->constraints_stokes,
-                this->fe_stokes.component_mask(velocity)
-            );
-        }
+        std::vector<GridTools::PeriodicFacePair<
+            typename DoFHandler<dim>::cell_iterator>
+        > periodicity_vectorY;
+
+        GridTools::collect_periodic_faces(this->dof_handler_stokes,
+                                          0,1,0,periodicity_vectorX);
+        GridTools::collect_periodic_faces(this->dof_handler_stokes,
+                                          2,3,1,periodicity_vectorY);
+
+        DoFTools::make_periodicity_constraints<dim,dim>(periodicity_vectorX,
+                                                        this->constraints_stokes);
+        DoFTools::make_periodicity_constraints<dim,dim>(periodicity_vectorY,
+                                                        this->constraints_stokes);
+
 
         this->constraints_stokes.close();
     }
@@ -999,6 +1028,26 @@ void SCHSolver<dim>::setupDoFsCahnHilliard()
 
         DoFTools::make_hanging_node_constraints(this->dof_handler_ch,
                                                 this->constraints_ch);
+
+        // Add the periodic constraints
+        std::vector<GridTools::PeriodicFacePair<
+            typename DoFHandler<dim>::cell_iterator>
+        > periodicity_vectorX;
+
+        std::vector<GridTools::PeriodicFacePair<
+            typename DoFHandler<dim>::cell_iterator>
+        > periodicity_vectorY;
+
+        GridTools::collect_periodic_faces(this->dof_handler_ch,
+                                          0,1,0,periodicity_vectorX);
+        GridTools::collect_periodic_faces(this->dof_handler_ch,
+                                          2,3,1,periodicity_vectorY);
+
+        DoFTools::make_periodicity_constraints<dim,dim>(periodicity_vectorX,
+                                                        this->constraints_ch);
+        DoFTools::make_periodicity_constraints<dim,dim>(periodicity_vectorY,
+                                                        this->constraints_ch);
+        
         this->constraints_ch.close();
     }
 
@@ -1843,6 +1892,28 @@ void SCHSolver<dim>::solveStokes()
     this->constraints_stokes.distribute(locally_owned_solution);
     this->solution_stokes = locally_owned_solution;
 
+    FEValuesExtractors::Scalar pressure(dim);
+    ComponentMask pressure_mask = this->fe_stokes.component_mask(pressure);
+    
+    for(uint component = 0; component < dim+1; component++)
+    {
+        auto value = VectorTools::compute_mean_value(
+            this->dof_handler_stokes,
+            this->quad_formula,
+            this->solution_stokes,
+            component
+        );
+
+        VectorTools::add_constant(
+            this->solution_stokes,
+            this->dof_handler_stokes,
+            component,
+            -1.*value
+        );
+    }
+
+    this->solution_stokes.compress(VectorOperation::add);
+
     this->pcout << "Solved in " << sc.last_step() << " steps." << std::endl;
     this->pcout << "Solution norms:\n"
                 << "\tBlock 0: "
@@ -1921,6 +1992,51 @@ void SCHSolver<dim>::solveCahnHilliard()
     this->solution_ch = locally_owned_solution;
 
     this->pcout << "Completed in " << sc.last_step() << " steps" << std::endl;
+
+    if(debug)
+    {
+        FEValuesExtractors::Scalar phi(0);
+        FEValuesExtractors::Scalar eta(1);
+
+        ComponentMask phi_mask = this->fe_ch.component_mask(phi);
+        ComponentMask eta_mask = this->fe_ch.component_mask(eta);
+
+        auto phi_dofs = DoFTools::locally_owned_dofs_per_component(
+            this->dof_handler_ch, phi_mask)[0];
+        auto eta_dofs = DoFTools::locally_owned_dofs_per_component(
+            this->dof_handler_ch, eta_mask)[1];
+
+        TrilinosWrappers::MPI::Vector local_phi(phi_dofs,
+                                                mpi_communicator);
+        TrilinosWrappers::MPI::Vector local_eta(eta_dofs,
+                                                mpi_communicator);
+
+        this->solution_ch.extract_subvector_to(phi_dofs.begin(), phi_dofs.end(), local_phi.begin());
+        this->solution_ch.extract_subvector_to(eta_dofs.begin(), eta_dofs.end(), local_eta.begin());
+
+        auto phi_range = std::minmax_element(
+            local_phi.begin(),
+            local_phi.end());
+        auto eta_range = std::minmax_element(
+            local_eta.begin(),
+            local_eta.end());
+
+        this->pcout << "Solution range:\n"
+                    << "    Phi Range: (" 
+                        << Utilities::MPI::min(*phi_range.first,
+                                               mpi_communicator) << ", " 
+                        << Utilities::MPI::max(*phi_range.second,
+                                               mpi_communicator)
+                    << ")" 
+                    << std::endl;
+        this->pcout << "    Eta Range: (" 
+                        << Utilities::MPI::min(*eta_range.first,
+                                               mpi_communicator) << ", " 
+                        << Utilities::MPI::max(*eta_range.second,
+                                               mpi_communicator)
+                    << ")" 
+                    << std::endl;
+    }
 
 }
 
@@ -2271,7 +2387,15 @@ void SCHSolver<dim>::run(bool debug)
             this->solveStokes();
             this->updateTimestep();
 
+            if(i < 10)
+            {
+                this->solution_old_stokes = this->solution_stokes;
+                this->timestep_old = this->timestep;
+            }
+
             this->assembleCahnHilliardMatrix();
+
+            if(i < 10) this->outputTimestep(0);
 
             refineFlag = false;
         } else {

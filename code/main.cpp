@@ -2058,6 +2058,10 @@ void SCHSolver<dim>::refineGrid()
                                     triangulation.n_active_cells());
     Vector<float>               estimated_errors_ch(
                                     triangulation.n_active_cells());
+    
+    TrilinosWrappers::MPI::BlockVector  locally_owned_rhs_stokes;
+    locally_owned_rhs_stokes.reinit(this->solution_stokes);
+    locally_owned_rhs_stokes = this->rhs_stokes;
 
     KellyErrorEstimator<dim>::estimate(
         this->dof_handler_stokes,
@@ -2404,8 +2408,6 @@ void SCHSolver<dim>::run(bool debug)
             this->solveStokes();
 
         }
-
-    	//if(debug) this->outputStokes();
 
         this->pcout << "Current timestep: " << this->timestep << std::endl;
         this->assembleCahnHilliardRHS();
